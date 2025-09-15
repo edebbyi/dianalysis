@@ -1,2 +1,2 @@
 # dianalysis
-ML + FastAPI service that scores foods for diabetes risk (0–100) and suggests same-aisle swaps. Supervised model with rule-based reasons.
+ML + FastAPI service that scores foods for diabetes risk (0–100) and suggests same-aisle swaps. Supervised model with rule-based reasons.dianalysis is a small, production-style ML + FastAPI project that turns nutrition facts into a 0–100 spike risk and offers same-aisle swaps with quantified improvements (e.g., net carbs ↓ 15g, fiber ↑ 4g). It uses supervised classification (ok vs risky) with a transparent rule layer for human-readable reasons, and exposes a simple /score endpoint for demos and integrations. Educational demo; not medical advice.
