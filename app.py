@@ -127,6 +127,7 @@ def _show_dismissable_message(key: str, text: str, style: str = "info"):
     if container.button("Dismiss", key=f"dismiss_{key}"):
         st.session_state[hidden_flag] = True
         container.empty()
+        st.experimental_rerun()
 
 
 def _curated_snack_candidates():
