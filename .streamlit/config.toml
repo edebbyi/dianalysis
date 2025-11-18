@@ -1,6 +1,3 @@
 [server]
 headless = true
 enableCORS = false
-
-[global]
-pip = "pip install -r requirements.txt"
