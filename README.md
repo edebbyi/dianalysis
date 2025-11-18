@@ -34,10 +34,6 @@ Serves an interactive UI on `http://localhost:8501` for scoring items and browsi
 - `dianalysis/scoring.py`: customize `ALT_GROUP_PRIORITIES`, risk thresholds, or alternative ranking rules here.
 - Streamlit respects `STREAMLIT_SERVER_PORT` / `STREAMLIT_SERVER_HEADLESS` environment overrides when running `app.py`.
 
-## Manual / Wiki
-
-See the `docs/` directory or the GitHub wiki for deeper architecture notes, data-pipeline details, and troubleshooting guidance.
-
 ## Contributions
 
 1. Fork the repository.
