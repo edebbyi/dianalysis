@@ -8,6 +8,17 @@ import os
 from dianalysis.model import load_model, generate_synthetic_data, train_model, compute_net_carbs
 from dianalysis.scoring import score_item, score_by_barcode
 
+try:
+    from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
+    from streamlit.runtime.scriptrunner_utils.script_requests import RerunData
+
+    def _request_rerun():
+        raise RerunException(RerunData())
+
+except ImportError:  # fallback when running in environments without rerun helpers
+    def _request_rerun():
+        return
+
 # Page configuration
 st.set_page_config(
     page_title="Dianalysis - Food Risk Scoring",
@@ -127,7 +138,7 @@ def _show_dismissable_message(key: str, text: str, style: str = "info"):
     if container.button("Dismiss", key=f"dismiss_{key}"):
         st.session_state[hidden_flag] = True
         container.empty()
-        st.experimental_rerun()
+        _request_rerun()
 
 
 def _curated_snack_candidates():
