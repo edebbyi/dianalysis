@@ -1,9 +1,0 @@
-services:
-  app:
-    build:
-      context: .
-      args:
-        REQUIREMENTS_FILE: requirements-docker.txt
-    ports:
-      - "8501:8501"
-    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true

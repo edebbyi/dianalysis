@@ -1,30 +1,22 @@
 """
-Dianalysis Streamlit app (interactive scoring + recommendation UI).
-
-Why:
-- Keep all user-facing rendering and input flows in one place.
-- Keep model/recommendation business logic out of the UI layer.
+Dianalysis: Diabetes-aware food scoring Streamlit app.
 """
-
-from __future__ import annotations
-
-from typing import Any
 
 import streamlit as st
 import pandas as pd
 import os
-from dianalysis.model import load_model, generate_synthetic_data, train_model
+from dianalysis.model import load_model, generate_synthetic_data, train_model, compute_net_carbs
 from dianalysis.scoring import score_item, score_by_barcode
 
 try:
     from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
     from streamlit.runtime.scriptrunner_utils.script_requests import RerunData
 
-    def _request_rerun() -> None:
+    def _request_rerun():
         raise RerunException(RerunData())
 
 except ImportError:  # fallback when running in environments without rerun helpers
-    def _request_rerun() -> None:
+    def _request_rerun():
         return
 
 # Page configuration
@@ -57,30 +49,22 @@ st.markdown("""
         color: #555 !important;
         margin-bottom: 4px;
     }
-    .tier-good { border-left: 4px solid #6c757d; }
+    .tier-good { border-left: 4px solid #28a745; }
     .tier-better { border-left: 4px solid #17a2b8; }
-    .tier-best { border-left: 4px solid #28a745; }
+    .tier-best { border-left: 4px solid #007bff; }
 </style>
 """, unsafe_allow_html=True)
 
 
 @st.cache_resource
-def load_trained_model(_artifact_state: tuple[Any, ...]) -> tuple[Any, dict[str, Any], dict[str, Any] | None]:
+def load_trained_model():
     """Load or train the model."""
     artifacts_dir = "artifacts"
-
-    has_logreg_artifacts = os.path.exists(os.path.join(artifacts_dir, "model.joblib"))
-    has_xgb_artifacts = (
-        os.path.exists(os.path.join(artifacts_dir, "meta.joblib"))
-        and os.path.exists(os.path.join(artifacts_dir, "preprocessor.joblib"))
-        and os.path.exists(os.path.join(artifacts_dir, "xgb_model.json"))
-    )
-
-    if has_logreg_artifacts or has_xgb_artifacts:
+    
+    if os.path.exists(os.path.join(artifacts_dir, "model.joblib")):
         try:
             model, meta = load_model(artifacts_dir)
-            saved_metrics = meta.get("metrics") if isinstance(meta, dict) else None
-            return model, meta, saved_metrics
+            return model, meta, None
         except Exception as e:
             st.warning(f"Could not load existing model: {e}. Training new model...")
     
@@ -92,45 +76,16 @@ def load_trained_model(_artifact_state: tuple[Any, ...]) -> tuple[Any, dict[str,
     return model, meta, metrics
 
 
-def _artifact_state(artifacts_dir: str = "artifacts") -> tuple[Any, ...]:
-    """
-    Build a cache key from artifact file state so Streamlit refreshes model/metrics
-    when artifacts are retrained or replaced.
-    """
-    tracked = [
-        "meta.joblib",
-        "model.joblib",
-        "preprocessor.joblib",
-        "xgb_model.json",
-    ]
-    artifact_state: list[tuple[str, int, int] | tuple[str, None, None]] = []
-    for name in tracked:
-        path = os.path.join(artifacts_dir, name)
-        if os.path.exists(path):
-            artifact_state.append((name, int(os.path.getmtime(path)), os.path.getsize(path)))
-        else:
-            artifact_state.append((name, None, None))
-    return tuple(artifact_state)
-
-
 @st.cache_data
-def load_candidates_data() -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
+def load_candidates_data():
     """Load candidate products for alternatives from OpenFoodFacts."""
     clean_csv = "data/products_off_clean.csv"
-    scored_csv = "data/products_off_clean_scored.csv"
     
     messages = []
-    if os.path.exists(scored_csv):
-        try:
-            df = pd.read_csv(scored_csv, dtype={"upc": str})
-            messages.append(("info", "✅ Using pre-scored alternatives database", "off_fetch_scored_csv"))
-            return df, messages
-        except Exception as e:
-            st.warning(f"Could not load pre-scored alternatives database: {e}")
-
     if os.path.exists(clean_csv):
         try:
             df = pd.read_csv(clean_csv, dtype={"upc": str})
+            df = _append_curated_candidates(df)
             messages.append(("info", "✅ Using real OpenFoodFacts database for alternatives", "off_fetch_csv"))
             return df, messages
         except Exception as e:
@@ -155,6 +110,7 @@ def load_candidates_data() -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
         
         if all_products:
             df = pd.DataFrame(all_products)
+            df = _append_curated_candidates(df)
             messages.append(("success", f"✅ Loaded {len(df)} real products from OpenFoodFacts", "off_fetch_success"))
             return df, messages
         else:
@@ -164,11 +120,12 @@ def load_candidates_data() -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
     
     # Fallback: use synthetic data
     df = generate_synthetic_data(n=500, random_state=42)
+    df = _append_curated_candidates(df)
     messages.append(("info", "📊 Using synthetic data for alternatives (demo mode)", "off_fetch_synthetic"))
     return df, messages
 
 
-def _show_dismissable_message(key: str, text: str, style: str = "info") -> None:
+def _show_dismissable_message(key: str, text: str, style: str = "info"):
     """Show a message with a dismiss button stored in session state."""
     hidden_flag = f"hide_message_{key}"
     if st.session_state.get(hidden_flag):
@@ -184,7 +141,268 @@ def _show_dismissable_message(key: str, text: str, style: str = "info") -> None:
         _request_rerun()
 
 
-def get_risk_class(score: float | int) -> str:
+def _curated_snack_candidates():
+    """Add curated snack/chip entries to the candidate pool."""
+    now = pd.Timestamp.utcnow().isoformat()
+    snacks = [
+        {
+            "name": "Baked Corn Chips",
+            "brand": "Harvest Trail",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 30.0,
+            "calories": 140.0,
+            "carbs_g": 18.0,
+            "fiber_g": 3.0,
+            "sugar_g": 0.5,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 2.0,
+            "fat_g": 5.5,
+            "sodium_mg": 180.0,
+            "ingredients_text": "corn flour, sunflower oil, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000111000111",
+        },
+        {
+            "name": "Sea Salt Lentil Chips",
+            "brand": "Crunch Herb",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 28.0,
+            "calories": 130.0,
+            "carbs_g": 15.0,
+            "fiber_g": 4.5,
+            "sugar_g": 1.0,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 4.0,
+            "fat_g": 4.0,
+            "sodium_mg": 170.0,
+            "ingredients_text": "split lentils, rice flour, sunflower oil, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000222000222",
+        },
+        {
+            "name": "Multigrain Thin Chips",
+            "brand": "Wholesome Bites",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 28.0,
+            "calories": 120.0,
+            "carbs_g": 16.0,
+            "fiber_g": 3.0,
+            "sugar_g": 0.5,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 3.0,
+            "fat_g": 3.5,
+            "sodium_mg": 150.0,
+            "ingredients_text": "whole grain flour blend, vegetable oils, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000333000333",
+        },
+        {
+            "name": "Roasted Mixed Nuts",
+            "brand": "Harvest Road",
+            "category": "nut",
+            "alt_group": "nuts-seeds",
+            "serving_g": 30.0,
+            "calories": 170.0,
+            "carbs_g": 6.0,
+            "fiber_g": 3.5,
+            "sugar_g": 1.5,
+            "added_sugar_g": 0.5,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 6.0,
+            "fat_g": 14.0,
+            "sodium_mg": 80.0,
+            "ingredients_text": "almonds, cashews, walnuts, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000777000777",
+        },
+        {
+            "name": "Curry Spiced Pistachios",
+            "brand": "Spice Grove",
+            "category": "nut",
+            "alt_group": "nuts-seeds",
+            "serving_g": 28.0,
+            "calories": 160.0,
+            "carbs_g": 5.0,
+            "fiber_g": 3.0,
+            "sugar_g": 1.0,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 6.0,
+            "fat_g": 13.0,
+            "sodium_mg": 120.0,
+            "ingredients_text": "pistachios, curry powder, sunflower oil, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000888000888",
+        },
+        {
+            "name": "Reduced Cocoa Sandwich Cookie",
+            "brand": "Nutri Bakes",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 30.0,
+            "calories": 160.0,
+            "carbs_g": 22.0,
+            "fiber_g": 4.0,
+            "sugar_g": 9.0,
+            "added_sugar_g": 6.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 3.0,
+            "fat_g": 8.0,
+            "sodium_mg": 180.0,
+            "ingredients_text": "whole wheat flour, cocoa powder, chicory root fiber, vegetable oil",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000444000444",
+        },
+        {
+            "name": "Almond Butter Oat Cookie",
+            "brand": "Harvest Grain",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 25.0,
+            "calories": 140.0,
+            "carbs_g": 18.0,
+            "fiber_g": 3.5,
+            "sugar_g": 7.0,
+            "added_sugar_g": 4.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 4.0,
+            "fat_g": 6.0,
+            "sodium_mg": 140.0,
+            "ingredients_text": "oats, almond butter, flaxseed, honey",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000555000555",
+        },
+        {
+            "name": "Chocolate Chip Crisp",
+            "brand": "Wholesome Crunch",
+            "category": "snack",
+            "alt_group": "snack",
+            "serving_g": 28.0,
+            "calories": 150.0,
+            "carbs_g": 20.0,
+            "fiber_g": 3.0,
+            "sugar_g": 10.0,
+            "added_sugar_g": 7.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 2.0,
+            "fat_g": 7.0,
+            "sodium_mg": 120.0,
+            "ingredients_text": "oat flour, cane sugar, chocolate chips, sunflower oil",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000666000666",
+        },
+    ]
+    df = pd.DataFrame(snacks)
+    df["net_carbs_g"] = df.apply(lambda row: compute_net_carbs(row), axis=1)
+    return df
+
+
+def _curated_nut_candidates():
+    """Add healthier nut and seed candidates with extra fiber."""
+    now = pd.Timestamp.utcnow().isoformat()
+    nuts = [
+        {
+            "name": "High-Fiber Nut Medley",
+            "brand": "Pulse Root",
+            "category": "nut",
+            "alt_group": "nuts-seeds",
+            "serving_g": 30.0,
+            "calories": 160.0,
+            "carbs_g": 9.0,
+            "fiber_g": 5.5,
+            "sugar_g": 1.5,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 5.0,
+            "fat_g": 12.0,
+            "sodium_mg": 80.0,
+            "ingredients_text": "almonds, walnuts, tiger nuts, flax seeds, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000999000999",
+        },
+        {
+            "name": "Sprouted Pumpkin Seed Crisp",
+            "brand": "Kernel Health",
+            "category": "nut",
+            "alt_group": "nuts-seeds",
+            "serving_g": 30.0,
+            "calories": 150.0,
+            "carbs_g": 8.0,
+            "fiber_g": 6.0,
+            "sugar_g": 0.5,
+            "added_sugar_g": 0.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 7.0,
+            "fat_g": 11.0,
+            "sodium_mg": 110.0,
+            "ingredients_text": "sprouted pumpkin seeds, chickpea flour, olive oil, sea salt",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000888000888",
+        },
+        {
+            "name": "Curated Pistachio Crunch",
+            "brand": "Green Shell",
+            "category": "nut",
+            "alt_group": "nuts-seeds",
+            "serving_g": 28.0,
+            "calories": 170.0,
+            "carbs_g": 7.0,
+            "fiber_g": 6.5,
+            "sugar_g": 2.0,
+            "added_sugar_g": 1.0,
+            "sugar_alcohols_g": 0.0,
+            "protein_g": 6.0,
+            "fat_g": 13.0,
+            "sodium_mg": 100.0,
+            "ingredients_text": "pistachios, sea salt, olive oil",
+            "source": "curated",
+            "created_at": now,
+            "upc": "000777000777",
+        },
+    ]
+    df = pd.DataFrame(nuts)
+    df["net_carbs_g"] = df.apply(lambda row: compute_net_carbs(row), axis=1)
+    return df
+
+
+def _append_curated_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Append curated snack+nut candidates and dedupe."""
+    curated = pd.concat(
+        [
+            _curated_snack_candidates(),
+            _curated_nut_candidates(),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    df = pd.concat([df, curated], ignore_index=True, sort=False)
+    return _drop_duplicate_candidates(df)
+
+
+def _drop_duplicate_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Deduplicate candidate pool by name/brand to keep curated items unique."""
+    if {"name", "brand"}.issubset(df.columns):
+        df = df.drop_duplicates(subset=["name", "brand"], keep="first")
+    return df
+
+
+def get_risk_class(score):
     """Get CSS class for risk score."""
     if score < 30:
         return "risk-low"
@@ -194,7 +412,7 @@ def get_risk_class(score: float | int) -> str:
         return "risk-high"
 
 
-def display_nutrition_table(display_dict: dict[str, Any]) -> None:
+def display_nutrition_table(display_dict):
     """Display nutrition facts table."""
     st.subheader("📊 Nutrition Facts")
     
@@ -216,7 +434,7 @@ def display_nutrition_table(display_dict: dict[str, Any]) -> None:
         col.metric(label, value)
 
 
-def display_alternatives(alternatives: list[dict[str, Any]]) -> None:
+def display_alternatives(alternatives):
     """Display alternative recommendations."""
     if not alternatives:
         st.info("No alternatives found in the same food group.")
@@ -224,14 +442,8 @@ def display_alternatives(alternatives: list[dict[str, Any]]) -> None:
 
     st.subheader("🔄 Better Alternatives")
     st.markdown("*These alternatives are in the same food group and have better nutritional profiles.*")
-
-    tier_order = {"best": 0, "better": 1, "good": 2}
-    ranked_alternatives = sorted(
-        alternatives,
-        key=lambda alt: tier_order.get(str(alt.get("tier", "good")).lower(), 99),
-    )
-
-    for alt in ranked_alternatives:
+    
+    for alt in alternatives:
         tier = alt.get("tier", "Good")
         tier_class = f"tier-{tier.lower()}"
         
@@ -245,7 +457,7 @@ def display_alternatives(alternatives: list[dict[str, Any]]) -> None:
         """, unsafe_allow_html=True)
 
 
-def render_result_columns(result: dict[str, Any] | None) -> None:
+def render_result_columns(result):
     """Render item details on left and alternatives on right."""
     if not result:
         return
@@ -281,7 +493,7 @@ def render_result_columns(result: dict[str, Any] | None) -> None:
         display_alternatives(result.get("alternatives", []))
 
 
-def display_alternatives_placeholder() -> None:
+def display_alternatives_placeholder():
     cols = st.columns([3, 2])
     with cols[0]:
         st.write("")
@@ -290,11 +502,11 @@ def display_alternatives_placeholder() -> None:
         st.info("Submit a food item to score it and see healthier swaps appear here.")
 
 
-def main() -> None:
+def main():
     """Main app function."""
     
     # Load model and data
-    model, meta, metrics = load_trained_model(_artifact_state())
+    model, meta, metrics = load_trained_model()
     df_candidates, candidate_messages = load_candidates_data()
     for style, text, key in candidate_messages:
         _show_dismissable_message(key, text, style=style)
@@ -303,36 +515,22 @@ def main() -> None:
     st.title("🍎 Dianalysis")
     st.markdown("### Diabetes-aware food scoring and recommendations")
     st.markdown(
-        "Scan a food, get a clear diabetes-risk signal, and discover smarter same-category swaps in seconds."
+        "Dianalysis is an educational demo that flags diabetes-relevant nutrition risks "
+        "and suggests better swaps from the same food group."
     )
     st.markdown(
-        "Your **risk score** is a calibrated 0‑100 probability (lower is better). "
-        "Under the hood, Dianalysis combines nutrition-rule logic with a trained classifier "
-        "(logistic or XGBoost, depending on loaded artifacts)."
+        "The **risk score** is a calibrated probability of being a high-risk product, "
+        "scaled to 0‑100 (lower is better). "
+        "It blends nutrition rules and a logistic model trained on synthetic food profiles."
     )
     
-    recommendation_eval = meta.get("recommendation_eval", {}) if isinstance(meta, dict) else {}
-    model_type = meta.get("model_type", "unknown") if isinstance(meta, dict) else "unknown"
-
     if metrics:
         with st.expander("📈 Model Performance Metrics"):
-            st.caption(f"Active model type: `{model_type}`")
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2 = st.columns(2)
             with col1:
-                st.markdown("**Validation**")
                 st.json(metrics.get("validation", {}))
             with col2:
-                st.markdown("**Test**")
                 st.json(metrics.get("test", {}))
-            with col3:
-                st.markdown("**Cross-Validation**")
-                st.json(metrics.get("cv", {}))
-            with col4:
-                st.markdown("**Recommendation Eval**")
-                if recommendation_eval:
-                    st.json(recommendation_eval)
-                else:
-                    st.caption("No recommendation eval found in model metadata.")
     
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
