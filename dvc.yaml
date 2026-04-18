@@ -1,0 +1,74 @@
+stages:
+  train:
+    cmd: >
+      python train.py
+      --config ${common.config}
+      --profile ${common.profile}
+      --random-state ${train.random_state}
+      --cv-folds ${train.cv_folds}
+    deps:
+      - train.py
+      - dianalysis
+      - configs/base.toml
+      - configs/profiles/xgboost.toml
+      - data/products_off_clean.csv
+    params:
+      - common.config
+      - common.profile
+      - train.random_state
+      - train.cv_folds
+    outs:
+      - artifacts
+
+  rescore:
+    cmd: >
+      python experiments/rescore_candidates.py
+      --config ${common.config}
+      --profile ${common.profile}
+      --input-csv ${rescore.input_csv}
+      --output-csv ${rescore.output_csv}
+      --no-train
+      --no-auto-train-if-missing
+      --qdrant-mode ${rescore.qdrant_mode}
+    deps:
+      - experiments/rescore_candidates.py
+      - dianalysis
+      - configs/base.toml
+      - configs/profiles/xgboost.toml
+      - ${rescore.input_csv}
+      - artifacts
+    params:
+      - common.config
+      - common.profile
+      - rescore.input_csv
+      - rescore.output_csv
+      - rescore.qdrant_mode
+    outs:
+      - ${rescore.output_csv}
+
+  quality_gate:
+    cmd: >
+      python experiments/model_quality_gate.py
+      --config ${common.config}
+      --profile ${common.profile}
+      --data ${quality_gate.data}
+      --cv-folds ${quality_gate.cv_folds}
+      --sample-size ${quality_gate.sample_size}
+      --report-path ${quality_gate.report_path}
+    deps:
+      - experiments/model_quality_gate.py
+      - dianalysis
+      - configs/base.toml
+      - configs/profiles/xgboost.toml
+      - ${quality_gate.data}
+      - artifacts
+      - ${rescore.output_csv}
+    params:
+      - common.config
+      - common.profile
+      - quality_gate.data
+      - quality_gate.cv_folds
+      - quality_gate.sample_size
+      - quality_gate.report_path
+    metrics:
+      - ${quality_gate.report_path}
