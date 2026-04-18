@@ -49,3 +49,6 @@ data/*_scored*.csv
 
 # Local-only module no longer used
 dianalysis/candidate_fixtures.py
+
+# Local DVC remote storage
+.dvcstore/
