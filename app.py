@@ -8,13 +8,65 @@ Why:
 
 from __future__ import annotations
 
+import argparse
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import sys
 from typing import Any
 
-import streamlit as st
 import pandas as pd
-import os
-from dianalysis.model import load_model, generate_synthetic_data, train_model
-from dianalysis.scoring import score_item, score_by_barcode
+import streamlit as st
+from dianalysis.run_config import cfg_get, load_runtime_config
+
+
+def _parse_app_config_args() -> argparse.Namespace:
+    """Parse optional app-level config/profile arguments after `streamlit run app.py -- ...`."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=Path, default=Path(os.getenv("DIANALYSIS_CONFIG", "configs/base.toml")))
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        default=(Path(os.environ["DIANALYSIS_PROFILE"]) if os.getenv("DIANALYSIS_PROFILE") else None),
+    )
+    args, _ = parser.parse_known_args(sys.argv[1:])
+    return args
+
+
+_APP_CFG_ARGS = _parse_app_config_args()
+_APP_CFG = load_runtime_config(_APP_CFG_ARGS.config, _APP_CFG_ARGS.profile)
+
+# Export active config/profile so downstream modules can read the same runtime profile.
+os.environ["DIANALYSIS_CONFIG"] = str(_APP_CFG_ARGS.config)
+if _APP_CFG_ARGS.profile:
+    os.environ["DIANALYSIS_PROFILE"] = str(_APP_CFG_ARGS.profile)
+else:
+    os.environ.pop("DIANALYSIS_PROFILE", None)
+
+# Apply retrieval defaults from config unless caller already set explicit env vars.
+if "DIANALYSIS_RETRIEVAL_BACKEND" not in os.environ:
+    os.environ["DIANALYSIS_RETRIEVAL_BACKEND"] = str(cfg_get(_APP_CFG, "retrieval", "backend", default="heuristic"))
+if "QDRANT_URL" not in os.environ:
+    os.environ["QDRANT_URL"] = str(cfg_get(_APP_CFG, "retrieval", "qdrant_url", default="http://localhost:6333"))
+if "DIANALYSIS_QDRANT_COLLECTION" not in os.environ:
+    os.environ["DIANALYSIS_QDRANT_COLLECTION"] = str(
+        cfg_get(_APP_CFG, "retrieval", "qdrant_collection", default="dianalysis_products")
+    )
+if "DIANALYSIS_EMBED_MODEL" not in os.environ:
+    os.environ["DIANALYSIS_EMBED_MODEL"] = str(
+        cfg_get(_APP_CFG, "retrieval", "embed_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    )
+
+_MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
+try:
+    from dianalysis.model import load_model, generate_synthetic_data, train_model
+    from dianalysis.scoring import score_item, score_by_barcode
+except ModuleNotFoundError as e:
+    _MODEL_IMPORT_ERROR = e
+
+ARTIFACTS_DIR = str(cfg_get(_APP_CFG, "paths", "artifacts_dir", default="artifacts"))
+CLEAN_CSV_PATH = str(cfg_get(_APP_CFG, "paths", "input_csv", default="data/products_off_clean.csv"))
+SCORED_CSV_PATH = str(cfg_get(_APP_CFG, "paths", "scored_csv", default="data/products_off_clean_scored.csv"))
 
 try:
     from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
@@ -63,11 +115,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+if _MODEL_IMPORT_ERROR is not None:
+    missing_pkg = getattr(_MODEL_IMPORT_ERROR, "name", "a required package")
+    st.error(
+        f"Missing Python package: `{missing_pkg}`. "
+        "This app needs the full project dependencies in the same Python environment."
+    )
+    st.info(f"Python executable in use: `{sys.executable}`")
+    st.code(f"{sys.executable} -m pip install -r requirements.txt", language="bash")
+    st.caption("If you prefer Docker, run: `make app`.")
+    st.stop()
+
 
 @st.cache_resource
 def load_trained_model(_artifact_state: tuple[Any, ...]) -> tuple[Any, dict[str, Any], dict[str, Any] | None]:
     """Load or train the model."""
-    artifacts_dir = "artifacts"
+    artifacts_dir = ARTIFACTS_DIR
 
     has_logreg_artifacts = os.path.exists(os.path.join(artifacts_dir, "model.joblib"))
     has_xgb_artifacts = (
@@ -92,7 +155,7 @@ def load_trained_model(_artifact_state: tuple[Any, ...]) -> tuple[Any, dict[str,
     return model, meta, metrics
 
 
-def _artifact_state(artifacts_dir: str = "artifacts") -> tuple[Any, ...]:
+def _artifact_state(artifacts_dir: str = ARTIFACTS_DIR) -> tuple[Any, ...]:
     """
     Build a cache key from artifact file state so Streamlit refreshes model/metrics
     when artifacts are retrained or replaced.
@@ -113,11 +176,45 @@ def _artifact_state(artifacts_dir: str = "artifacts") -> tuple[Any, ...]:
     return tuple(artifact_state)
 
 
+def _infer_model_type(meta: dict[str, Any] | None, artifacts_dir: str = ARTIFACTS_DIR) -> str:
+    """Resolve active model type from metadata first, then artifact files."""
+    if isinstance(meta, dict):
+        raw = str(meta.get("model_type", "")).strip().lower()
+        if raw in {"logreg", "xgboost"}:
+            return raw
+
+    has_xgb = (
+        os.path.exists(os.path.join(artifacts_dir, "meta.joblib"))
+        and os.path.exists(os.path.join(artifacts_dir, "preprocessor.joblib"))
+        and os.path.exists(os.path.join(artifacts_dir, "xgb_model.json"))
+    )
+    if has_xgb:
+        return "xgboost"
+    if os.path.exists(os.path.join(artifacts_dir, "model.joblib")):
+        return "logreg"
+    return "unavailable"
+
+
+def _metrics_timestamp_utc(meta: dict[str, Any] | None, artifacts_dir: str = ARTIFACTS_DIR) -> tuple[str | None, str | None]:
+    """Return best-available metrics timestamp in UTC and where it came from."""
+    if isinstance(meta, dict):
+        recommendation_eval = meta.get("recommendation_eval", {})
+        evaluated_at_utc = recommendation_eval.get("evaluated_at_utc") if isinstance(recommendation_eval, dict) else None
+        if isinstance(evaluated_at_utc, str) and evaluated_at_utc.strip():
+            return evaluated_at_utc, "recommendation_eval.evaluated_at_utc"
+
+    meta_path = os.path.join(artifacts_dir, "meta.joblib")
+    if os.path.exists(meta_path):
+        mtime_utc = datetime.fromtimestamp(os.path.getmtime(meta_path), tz=timezone.utc).isoformat()
+        return mtime_utc, "meta.joblib mtime"
+    return None, None
+
+
 @st.cache_data
 def load_candidates_data() -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
     """Load candidate products for alternatives from OpenFoodFacts."""
-    clean_csv = "data/products_off_clean.csv"
-    scored_csv = "data/products_off_clean_scored.csv"
+    clean_csv = CLEAN_CSV_PATH
+    scored_csv = SCORED_CSV_PATH
     
     messages = []
     if os.path.exists(scored_csv):
@@ -310,13 +407,27 @@ def main() -> None:
         "Under the hood, Dianalysis combines nutrition-rule logic with a trained classifier "
         "(logistic or XGBoost, depending on loaded artifacts)."
     )
+    st.caption(
+        f"Config: `{_APP_CFG_ARGS.config}`"
+        + (f" | Profile: `{_APP_CFG_ARGS.profile}`" if _APP_CFG_ARGS.profile else "")
+    )
     
     recommendation_eval = meta.get("recommendation_eval", {}) if isinstance(meta, dict) else {}
-    model_type = meta.get("model_type", "unknown") if isinstance(meta, dict) else "unknown"
+    model_type = _infer_model_type(meta, ARTIFACTS_DIR)
+    if isinstance(meta, dict):
+        meta["model_type"] = model_type
+    metrics_timestamp, metrics_timestamp_source = _metrics_timestamp_utc(meta, ARTIFACTS_DIR)
 
     if metrics:
         with st.expander("📈 Model Performance Metrics"):
-            st.caption(f"Active model type: `{model_type}`")
+            if model_type == "unavailable":
+                st.error("Active model type could not be determined from artifacts.")
+            else:
+                st.caption(f"Active model type: `{model_type}`")
+            if metrics_timestamp:
+                st.caption(f"Latest metrics timestamp (UTC): `{metrics_timestamp}`")
+                if metrics_timestamp_source:
+                    st.caption(f"Timestamp source: `{metrics_timestamp_source}`")
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.markdown("**Validation**")
@@ -339,6 +450,10 @@ def main() -> None:
 
     # Sidebar
     st.sidebar.title("Input Method")
+    st.sidebar.caption(
+        f"Config: `{_APP_CFG_ARGS.config}`"
+        + (f"\nProfile: `{_APP_CFG_ARGS.profile}`" if _APP_CFG_ARGS.profile else "")
+    )
     input_method = st.sidebar.radio(
         "Choose how to score a food item:",
         ["Manual Entry", "Barcode Lookup"]
