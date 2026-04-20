@@ -28,7 +28,6 @@ from .model_components import (
     ModelType,
     build_pipeline,
     compute_net_carbs,
-    make_preprocessor,
     rule_points_and_reasons,
     weak_label,
 )
