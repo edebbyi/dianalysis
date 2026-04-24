@@ -45,7 +45,7 @@ else:
 
 # Apply retrieval defaults from config unless caller already set explicit env vars.
 if "DIANALYSIS_RETRIEVAL_BACKEND" not in os.environ:
-    os.environ["DIANALYSIS_RETRIEVAL_BACKEND"] = str(cfg_get(_APP_CFG, "retrieval", "backend", default="heuristic"))
+    os.environ["DIANALYSIS_RETRIEVAL_BACKEND"] = str(cfg_get(_APP_CFG, "retrieval", "backend", default="qdrant"))
 if "QDRANT_URL" not in os.environ:
     os.environ["QDRANT_URL"] = str(cfg_get(_APP_CFG, "retrieval", "qdrant_url", default="http://localhost:6333"))
 if "DIANALYSIS_QDRANT_COLLECTION" not in os.environ:
@@ -59,7 +59,7 @@ if "DIANALYSIS_EMBED_MODEL" not in os.environ:
 
 _MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:
-    from dianalysis.model import load_model, generate_synthetic_data, train_model
+    from dianalysis.model import compute_model_fingerprint, load_model, generate_synthetic_data, train_model
     from dianalysis.scoring import score_item, score_by_barcode
 except ModuleNotFoundError as e:
     _MODEL_IMPORT_ERROR = e
@@ -67,6 +67,21 @@ except ModuleNotFoundError as e:
 ARTIFACTS_DIR = str(cfg_get(_APP_CFG, "paths", "artifacts_dir", default="artifacts"))
 CLEAN_CSV_PATH = str(cfg_get(_APP_CFG, "paths", "input_csv", default="data/products_off_clean.csv"))
 SCORED_CSV_PATH = str(cfg_get(_APP_CFG, "paths", "scored_csv", default="data/products_off_clean_scored.csv"))
+MANUAL_DEFAULTS: dict[str, Any] = {
+    "name": "Frosted Cereal",
+    "brand": "",
+    "category": "cereal",
+    "serving_g": 40.0,
+    "calories": 160.0,
+    "fat_g": 2.0,
+    "carbs_g": 37.0,
+    "fiber_g": 3.0,
+    "sugar_g": 14.0,
+    "added_sugar_g": 10.0,
+    "protein_g": 3.0,
+    "sodium_mg": 240.0,
+}
+MANUAL_CATEGORY_OPTIONS = ["cereal", "bread", "snack", "drink", "dairy", "grain"]
 
 try:
     from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
@@ -90,28 +105,55 @@ st.set_page_config(
 # Custom CSS
 st.markdown("""
 <style>
-    .risk-low { color: #28a745; font-weight: bold; font-size: 2em; }
-    .risk-medium { color: #ffc107; font-weight: bold; font-size: 2em; }
-    .risk-high { color: #dc3545; font-weight: bold; font-size: 2em; }
+    section.main > div.block-container {
+        padding-top: 1.1rem;
+    }
+    .risk-low { color: #22c55e; font-weight: 700; }
+    .risk-medium { color: #f59e0b; font-weight: 700; }
+    .risk-high { color: #ef4444; font-weight: 700; }
+    .result-card {
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 12px;
+        padding: 16px;
+        margin: 8px 0 16px 0;
+        background: rgba(15, 23, 42, 0.02);
+    }
+    .score-big {
+        font-size: 2.4rem;
+        line-height: 1;
+        margin: 8px 0;
+        font-weight: 800;
+    }
+    .score-subtle {
+        color: rgba(148, 163, 184, 0.95);
+        font-size: 0.92rem;
+        margin-top: 6px;
+    }
+    .driver-chip {
+        display: inline-block;
+        border: 1px solid rgba(148, 163, 184, 0.32);
+        border-radius: 999px;
+        padding: 3px 10px;
+        margin: 4px 6px 0 0;
+        font-size: 0.80rem;
+        background-color: transparent;
+    }
     .alternative-card {
-        border: 1px solid #ddd;
-        border-radius: 8px;
-        padding: 15px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 12px;
+        padding: 12px;
         margin: 10px 0;
-        background-color: #f8f9fa;
-        color: #333;
+        background: rgba(15, 23, 42, 0.015);
     }
     .alternative-card h4 {
-        color: #333 !important;
+        margin: 0 0 2px 0;
+        font-size: 0.98rem;
+    }
+    .alt-meta {
+        color: rgba(148, 163, 184, 0.95);
+        font-size: 0.86rem;
         margin-bottom: 8px;
     }
-    .alternative-card p {
-        color: #555 !important;
-        margin-bottom: 4px;
-    }
-    .tier-good { border-left: 4px solid #6c757d; }
-    .tier-better { border-left: 4px solid #17a2b8; }
-    .tier-best { border-left: 4px solid #28a745; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -265,6 +307,53 @@ def load_candidates_data() -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
     return df, messages
 
 
+@st.cache_resource
+def warmup_retrieval() -> str:
+    """
+    Warm retrieval dependencies at app startup.
+
+    Why:
+    - Streamlit app instances can cold-start after idle/redeploy.
+    - A tiny warm-up (embed + one Qdrant call) reduces first-user latency.
+    """
+    enabled = str(os.getenv("DIANALYSIS_WARMUP_RETRIEVAL", "1")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return "disabled"
+
+    backend = str(os.getenv("DIANALYSIS_RETRIEVAL_BACKEND", "qdrant")).strip().lower()
+    if backend != "qdrant":
+        return "skipped (backend)"
+
+    try:
+        from dianalysis.recommendation.vector_client import (
+            collection_name,
+            embedder,
+            qdrant_client,
+            retrieval_enabled,
+        )
+
+        if not retrieval_enabled():
+            return "skipped (deps)"
+
+        emb = embedder()
+        vec = emb.encode(["dianalysis warmup"], normalize_embeddings=True, show_progress_bar=False)[0].tolist()
+
+        client = qdrant_client()
+        collection = collection_name()
+        # Collection check warms client auth/session and validates target collection.
+        client.get_collection(collection_name=collection)
+        # Tiny query warms vector retrieval path.
+        client.query_points(
+            collection_name=collection,
+            query=vec,
+            limit=1,
+            with_payload=False,
+        )
+        return "ok"
+    except Exception:
+        return "failed"
+
+
 def _show_dismissable_message(key: str, text: str, style: str = "info") -> None:
     """Show a message with a dismiss button stored in session state."""
     hidden_flag = f"hide_message_{key}"
@@ -291,9 +380,65 @@ def get_risk_class(score: float | int) -> str:
         return "risk-high"
 
 
+def get_risk_tier(score: float | int) -> str:
+    """Return user-facing risk tier text."""
+    if score < 30:
+        return "Low"
+    if score < 70:
+        return "Moderate"
+    return "High"
+
+
+def get_risk_takeaway(score: float | int) -> str:
+    """Return one-line scientifically grounded takeaway text."""
+    if score < 30:
+        return "Lower screening risk for this serving based on carb, sugar, sodium, fiber, and protein signals."
+    if score < 70:
+        return "Mixed screening signal: some risk nutrients are present, with partial protective offsets."
+    return "Higher screening risk for this serving, driven by high-load nutrients and limited protective offsets."
+
+
+def _display_to_float(display_dict: dict[str, Any], key: str) -> float | None:
+    """Parse a display field like '14.0g' or '240mg' into a float."""
+    raw = display_dict.get(key)
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text or "not listed" in text:
+        return None
+    cleaned = (
+        text.replace("mg", "")
+        .replace("g", "")
+        .replace("kcal", "")
+        .replace("<", "")
+        .strip()
+    )
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _reset_manual_form() -> None:
+    """Reset manual-entry widgets to defaults and clear displayed result."""
+    st.session_state["manual_name"] = MANUAL_DEFAULTS["name"]
+    st.session_state["manual_brand"] = MANUAL_DEFAULTS["brand"]
+    st.session_state["manual_category"] = MANUAL_DEFAULTS["category"]
+    st.session_state["manual_serving_g"] = MANUAL_DEFAULTS["serving_g"]
+    st.session_state["manual_calories"] = MANUAL_DEFAULTS["calories"]
+    st.session_state["manual_fat_g"] = MANUAL_DEFAULTS["fat_g"]
+    st.session_state["manual_carbs_g"] = MANUAL_DEFAULTS["carbs_g"]
+    st.session_state["manual_fiber_g"] = MANUAL_DEFAULTS["fiber_g"]
+    st.session_state["manual_sugar_g"] = MANUAL_DEFAULTS["sugar_g"]
+    st.session_state["manual_added_sugar_g"] = MANUAL_DEFAULTS["added_sugar_g"]
+    st.session_state["manual_protein_g"] = MANUAL_DEFAULTS["protein_g"]
+    st.session_state["manual_sodium_mg"] = MANUAL_DEFAULTS["sodium_mg"]
+    st.session_state["last_result"] = None
+
+
 def display_nutrition_table(display_dict: dict[str, Any]) -> None:
     """Display nutrition facts table."""
-    st.subheader("📊 Nutrition Facts")
+    st.subheader("Nutrition Facts")
     
     cols = st.columns(4)
     nutrients = [
@@ -313,33 +458,84 @@ def display_nutrition_table(display_dict: dict[str, Any]) -> None:
         col.metric(label, value)
 
 
-def display_alternatives(alternatives: list[dict[str, Any]]) -> None:
-    """Display alternative recommendations."""
+def display_alternatives(
+    alternatives: list[dict[str, Any]],
+    *,
+    current_risk: float | int | None,
+    current_net: float | None,
+    current_fiber: float | None,
+) -> None:
+    """Display alternative recommendations as data-rich cards."""
     if not alternatives:
-        st.info("No alternatives found in the same food group.")
+        st.info("No lower-risk alternatives were found in the current dataset for this food group.")
         return
 
-    st.subheader("🔄 Better Alternatives")
-    st.markdown("*These alternatives are in the same food group and have better nutritional profiles.*")
+    st.subheader("Better Alternatives")
+    st.caption("Same-group swaps ranked to reduce glycemic load while keeping the food context familiar.")
 
     tier_order = {"best": 0, "better": 1, "good": 2}
-    ranked_alternatives = sorted(
-        alternatives,
-        key=lambda alt: tier_order.get(str(alt.get("tier", "good")).lower(), 99),
-    )
+
+    def _as_float(val: Any, default: float) -> float:
+        """Safely cast a value to float without turning 0 into the default."""
+        try:
+            if val is None:
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _sort_key(alt: dict[str, Any]) -> tuple[Any, ...]:
+        alt_risk = _as_float(alt.get("risk_score"), 100.0)
+        alt_net = float(alt.get("net_carbs_g", 0.0) or 0.0)
+        alt_fiber = float(alt.get("fiber_g", 0.0) or 0.0)
+        tier_rank = tier_order.get(str(alt.get("tier", "good")).lower(), 99)
+        return (alt_risk, alt_net, -alt_fiber, tier_rank)
+
+    ranked_alternatives = sorted(alternatives, key=_sort_key)
 
     for alt in ranked_alternatives:
-        tier = alt.get("tier", "Good")
-        tier_class = f"tier-{tier.lower()}"
-        
-        st.markdown(f"""
-        <div class="alternative-card {tier_class}">
-            <h4>{tier} Choice: {alt.get('name', 'Unknown')}</h4>
-            <p><strong>Brand:</strong> {alt.get('brand', 'N/A')}</p>
-            <p><strong>Risk Score:</strong> {alt.get('risk_display', alt.get('risk_score', '—'))}</p>
-            <p><strong>Why better:</strong> {alt.get('why', 'Lower risk in same category')}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        tier = str(alt.get("tier", "Good")).title()
+        alt_name = str(alt.get("name", "Unknown"))
+        alt_brand = alt.get("brand", "N/A")
+        alt_risk = _as_float(alt.get("risk_score"), 100.0)
+        alt_risk_value = "<1" if alt_risk < 1 else f"{int(round(alt_risk))}"
+        alt_risk_tier = get_risk_tier(alt_risk)
+        alt_risk_class = get_risk_class(alt_risk)
+        alt_net = float(alt.get("net_carbs_g", 0.0) or 0.0)
+        alt_fiber = float(alt.get("fiber_g", 0.0) or 0.0)
+
+        net_delta_txt = "net carbs: n/a"
+        if current_net is not None:
+            delta_net = alt_net - float(current_net)
+            if delta_net < 0:
+                net_delta_txt = f"net carbs: {delta_net:.1f}g"
+            else:
+                net_delta_txt = f"net carbs: +{delta_net:.1f}g"
+
+        fiber_delta_txt = "fiber: n/a"
+        if current_fiber is not None:
+            delta_fiber = alt_fiber - float(current_fiber)
+            if delta_fiber >= 0:
+                fiber_delta_txt = f"fiber: +{delta_fiber:.1f}g"
+            else:
+                fiber_delta_txt = f"fiber: {delta_fiber:.1f}g"
+
+        st.markdown(
+            f"""
+            <div class="alternative-card">
+                <h4>{tier} Choice: {alt_name}</h4>
+                <div class="alt-meta">Brand: {alt_brand}</div>
+                <div><strong>Risk score:</strong> <span class="{alt_risk_class}">{alt_risk_value}</span></div>
+                <div class="alt-meta">Tier: <span class="{alt_risk_class}">{alt_risk_tier}</span></div>
+                <div style="margin-top:4px;">
+                    <span class="driver-chip">{net_delta_txt}</span>
+                    <span class="driver-chip">{fiber_delta_txt}</span>
+                </div>
+                <div style="margin-top:8px;"><strong>Why better:</strong> {alt.get('why', 'Lower risk in same category')}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_result_columns(result: dict[str, Any] | None) -> None:
@@ -347,27 +543,98 @@ def render_result_columns(result: dict[str, Any] | None) -> None:
     if not result:
         return
     
-    risk_score = result.get("risk_score", 0)
+    insufficient_data = bool(result.get("insufficient_data"))
+    risk_score_raw = float(result.get("risk_score", 0) or 0)
+    risk_score = float(result.get("risk_score_display", risk_score_raw) or risk_score_raw)
     risk_class = get_risk_class(risk_score)
+    risk_tier = get_risk_tier(risk_score)
+    takeaway = get_risk_takeaway(risk_score)
+    data_confidence = str(result.get("data_confidence", "high") or "high").lower()
+    confidence_notes = [str(x) for x in (result.get("data_confidence_notes") or []) if str(x).strip()]
+    display_dict = result.get("display", {}) or {}
+    current_net_val = float(result.get("item_net_carbs_g", 0.0) or 0.0)
+    current_net: float | None = current_net_val
+    if current_net_val <= 0:
+        carbs = _display_to_float(display_dict, "carbs_g")
+        fiber = _display_to_float(display_dict, "fiber_g")
+        if carbs is not None and fiber is not None:
+            current_net = max(carbs - fiber, 0.0)
+        else:
+            current_net = None
+    current_fiber = result.get("item_fiber_g")
+    if current_fiber is None:
+        current_fiber = _display_to_float(display_dict, "fiber_g")
+    top_drivers = result.get("reasons", [])[:3]
 
     st.divider()
     cols = st.columns([3, 2])
     with cols[0]:
-        st.markdown(f"""
-        ## Risk Score
-        <p class="{risk_class}">{result.get('risk_display', risk_score)}</p>
-        """, unsafe_allow_html=True)
+        if insufficient_data:
+            reason = result.get("insufficient_data_reason") or "Not enough nutrition information was available."
+            st.markdown(
+                f"""
+                <div class="result-card">
+                    <div><strong>Risk Score</strong></div>
+                    <div class="score-big">Not available</div>
+                    <div class="score-subtle">{reason}</div>
+                    <div class="score-subtle">You can still review alternatives below, or use Manual Entry for a full score.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""
+                <div class="result-card">
+                    <div><strong>Risk Score</strong></div>
+                    <div class="score-big {risk_class}">{result.get('risk_display', int(round(risk_score)))}</div>
+                    <div><strong>Tier:</strong> <span class="{risk_class}">{risk_tier}</span></div>
+                    <div class="score-subtle">{takeaway}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if data_confidence == "low":
+                if confidence_notes:
+                    details = "; ".join(confidence_notes[:2])
+                    if len(confidence_notes) > 2:
+                        details += "; ..."
+                    st.warning(f"Data confidence is low: {details}.")
+                else:
+                    st.warning("Data confidence is low: some critical nutrition fields were missing.")
         
         st.subheader(f"{result.get('item_name', 'Unknown Food')}")
         if result.get('item_brand'):
             st.caption(f"Brand: {result['item_brand']}")
-        st.caption(f"Category: {result.get('item_category', 'Unknown')} | Group: {result.get('item_alt_group', 'Unknown')}")
-        
-        st.subheader("📝 Why This Score?")
-        for reason in result.get("reasons", []):
-            st.write(f"• {reason}")
-        
-        display_nutrition_table(result.get("display", {}))
+        category_main = str(result.get("item_category_main", result.get("item_category", "Unknown")) or "Unknown")
+        alt_group = str(result.get("item_alt_group", "") or "").strip()
+        alt_group_fine = str(result.get("item_alt_group_fine", "") or "").strip()
+
+        caption_parts = [f"Category: {category_main}"]
+        if alt_group and alt_group.lower() not in {"unknown", "none", "nan"}:
+            if alt_group.lower() != category_main.lower():
+                caption_parts.append(f"Group: {alt_group}")
+        if alt_group_fine and alt_group_fine.lower() not in {"unknown", "none", "nan"}:
+            type_display = alt_group_fine.split(":", 1)[1] if ":" in alt_group_fine else alt_group_fine
+            if type_display:
+                caption_parts.append(f"Type: {type_display}")
+
+        st.caption(" | ".join(caption_parts))
+
+        if not insufficient_data:
+            st.subheader("Top Drivers")
+            if top_drivers:
+                for reason in top_drivers:
+                    st.markdown(f"<span class='driver-chip'>{reason}</span>", unsafe_allow_html=True)
+            else:
+                st.write("No drivers available.")
+
+        display_nutrition_table(display_dict)
+
+        if not insufficient_data:
+            with st.expander("Show full explanation"):
+                for reason in result.get("reasons", []):
+                    st.write(f"• {reason}")
 
         if result.get("notes"):
             with st.expander("ℹ️ Data Notes"):
@@ -375,7 +642,12 @@ def render_result_columns(result: dict[str, Any] | None) -> None:
                     st.info(note)
 
     with cols[1]:
-        display_alternatives(result.get("alternatives", []))
+        display_alternatives(
+            result.get("alternatives", []),
+            current_risk=(None if insufficient_data else risk_score_raw),
+            current_net=current_net,
+            current_fiber=float(current_fiber) if current_fiber is not None else None,
+        )
 
 
 def display_alternatives_placeholder() -> None:
@@ -383,7 +655,7 @@ def display_alternatives_placeholder() -> None:
     with cols[0]:
         st.write("")
     with cols[1]:
-        st.subheader("🔄 Better Alternatives")
+        st.subheader("Better Alternatives")
         st.info("Submit a food item to score it and see healthier swaps appear here.")
 
 
@@ -392,100 +664,130 @@ def main() -> None:
     
     # Load model and data
     model, meta, metrics = load_trained_model(_artifact_state())
+    if isinstance(meta, dict):
+        os.environ["DIANALYSIS_MODEL_TYPE"] = str(meta.get("model_type", "") or "").strip().lower()
+    try:
+        os.environ["DIANALYSIS_MODEL_FINGERPRINT"] = compute_model_fingerprint(ARTIFACTS_DIR, meta=meta if isinstance(meta, dict) else None)
+    except Exception:
+        os.environ.pop("DIANALYSIS_MODEL_FINGERPRINT", None)
     df_candidates, candidate_messages = load_candidates_data()
+    _ = warmup_retrieval()
     for style, text, key in candidate_messages:
         _show_dismissable_message(key, text, style=style)
     
-    # Header
+    # Header (kept intentionally minimal so input is visible faster)
     st.title("🍎 Dianalysis")
-    st.markdown("### Diabetes-aware food scoring and recommendations")
-    st.markdown(
-        "Scan a food, get a clear diabetes-risk signal, and discover smarter same-category swaps in seconds."
-    )
-    st.markdown(
-        "Your **risk score** is a calibrated 0‑100 probability (lower is better). "
-        "Under the hood, Dianalysis combines nutrition-rule logic with a trained classifier "
-        "(logistic or XGBoost, depending on loaded artifacts)."
-    )
-    st.caption(
-        f"Config: `{_APP_CFG_ARGS.config}`"
-        + (f" | Profile: `{_APP_CFG_ARGS.profile}`" if _APP_CFG_ARGS.profile else "")
-    )
-    
+    st.markdown("### Diabetes-aware food scoring")
+    st.caption("Risk score is 0–100 (lower is better).")
+
     recommendation_eval = meta.get("recommendation_eval", {}) if isinstance(meta, dict) else {}
     model_type = _infer_model_type(meta, ARTIFACTS_DIR)
     if isinstance(meta, dict):
         meta["model_type"] = model_type
     metrics_timestamp, metrics_timestamp_source = _metrics_timestamp_utc(meta, ARTIFACTS_DIR)
-
-    if metrics:
-        with st.expander("📈 Model Performance Metrics"):
-            if model_type == "unavailable":
-                st.error("Active model type could not be determined from artifacts.")
-            else:
-                st.caption(f"Active model type: `{model_type}`")
-            if metrics_timestamp:
-                st.caption(f"Latest metrics timestamp (UTC): `{metrics_timestamp}`")
-                if metrics_timestamp_source:
-                    st.caption(f"Timestamp source: `{metrics_timestamp_source}`")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.markdown("**Validation**")
-                st.json(metrics.get("validation", {}))
-            with col2:
-                st.markdown("**Test**")
-                st.json(metrics.get("test", {}))
-            with col3:
-                st.markdown("**Cross-Validation**")
-                st.json(metrics.get("cv", {}))
-            with col4:
-                st.markdown("**Recommendation Eval**")
-                if recommendation_eval:
-                    st.json(recommendation_eval)
-                else:
-                    st.caption("No recommendation eval found in model metadata.")
     
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
 
     # Sidebar
     st.sidebar.title("Input Method")
-    st.sidebar.caption(
-        f"Config: `{_APP_CFG_ARGS.config}`"
-        + (f"\nProfile: `{_APP_CFG_ARGS.profile}`" if _APP_CFG_ARGS.profile else "")
-    )
     input_method = st.sidebar.radio(
         "Choose how to score a food item:",
-        ["Manual Entry", "Barcode Lookup"]
+        ["Manual Entry", "Barcode Lookup"],
+        key="input_method",
     )
     
     # Main content
     if input_method == "Manual Entry":
-        st.header("Manual Food Entry")
-        
-        col1, col2 = st.columns(2)
-        
+        header_cols = st.columns([5, 1.5])
+        with header_cols[0]:
+            st.header("Manual Food Entry")
+            st.caption(
+                "Enter per-serving values from the nutrition label. "
+                "The hints show the exact nutrient cutoffs used by this risk screen."
+            )
+        with header_cols[1]:
+            if st.button("Reset Form", use_container_width=True):
+                _reset_manual_form()
+                _request_rerun()
+
+        col1, col2 = st.columns(2, gap="large")
+
         with col1:
-            name = st.text_input("Food Name", value="Frosted Cereal")
-            brand = st.text_input("Brand (optional)", value="")
+            st.markdown("#### Basics")
+            name = st.text_input("Food Name", value=MANUAL_DEFAULTS["name"], key="manual_name")
+            brand = st.text_input("Brand (optional)", value=MANUAL_DEFAULTS["brand"], key="manual_brand")
             category = st.selectbox(
                 "Category",
-                ["cereal", "bread", "snack", "drink", "dairy", "grain"],
-                index=0
+                MANUAL_CATEGORY_OPTIONS,
+                index=0,
+                key="manual_category",
             )
-            serving_g = st.number_input("Serving Size (g)", value=40.0, min_value=1.0)
-            calories = st.number_input("Calories", value=160.0, min_value=0.0)
-        
+            serving_g = st.number_input(
+                "Serving Size (g)",
+                value=float(MANUAL_DEFAULTS["serving_g"]),
+                min_value=1.0,
+                key="manual_serving_g",
+                help="Use the serving size shown on the label.",
+            )
+            calories = st.number_input(
+                "Calories (kcal)",
+                value=float(MANUAL_DEFAULTS["calories"]),
+                min_value=0.0,
+                key="manual_calories",
+            )
+            fat_g = st.number_input(
+                "Fat (g)",
+                value=float(MANUAL_DEFAULTS["fat_g"]),
+                min_value=0.0,
+                key="manual_fat_g",
+            )
+
         with col2:
-            carbs_g = st.number_input("Carbs (g)", value=37.0, min_value=0.0)
-            fiber_g = st.number_input("Fiber (g)", value=3.0, min_value=0.0)
-            sugar_g = st.number_input("Total Sugar (g)", value=14.0, min_value=0.0)
-            added_sugar_g = st.number_input("Added Sugar (g)", value=10.0, min_value=0.0)
-            protein_g = st.number_input("Protein (g)", value=3.0, min_value=0.0)
-            fat_g = st.number_input("Fat (g)", value=2.0, min_value=0.0)
-            sodium_mg = st.number_input("Sodium (mg)", value=240.0, min_value=0.0)
-        
-        if st.button("🔍 Score This Food", type="primary"):
+            st.markdown("#### Nutrition (Per Serving)")
+            carbs_g = st.number_input(
+                "Total Carbs (g)",
+                value=float(MANUAL_DEFAULTS["carbs_g"]),
+                min_value=0.0,
+                key="manual_carbs_g",
+                help="High-risk rule trigger: >= 30g per serving.",
+            )
+            fiber_g = st.number_input(
+                "Fiber (g)",
+                value=float(MANUAL_DEFAULTS["fiber_g"]),
+                min_value=0.0,
+                key="manual_fiber_g",
+                help="Protective rule trigger: >= 5.6g per serving.",
+            )
+            sugar_g = st.number_input(
+                "Total Sugar (g)",
+                value=float(MANUAL_DEFAULTS["sugar_g"]),
+                min_value=0.0,
+                key="manual_sugar_g",
+            )
+            added_sugar_g = st.number_input(
+                "Added Sugar (g)",
+                value=float(MANUAL_DEFAULTS["added_sugar_g"]),
+                min_value=0.0,
+                key="manual_added_sugar_g",
+                help="High-risk rule trigger: >= 10g per serving.",
+            )
+            protein_g = st.number_input(
+                "Protein (g)",
+                value=float(MANUAL_DEFAULTS["protein_g"]),
+                min_value=0.0,
+                key="manual_protein_g",
+                help="Protective rule trigger: >= 10g per serving.",
+            )
+            sodium_mg = st.number_input(
+                "Sodium (mg)",
+                value=float(MANUAL_DEFAULTS["sodium_mg"]),
+                min_value=0.0,
+                key="manual_sodium_mg",
+                help="High-risk rule trigger: >= 460mg per serving.",
+            )
+
+        if st.button("Score This Food", type="primary"):
             item = {
                 "name": name,
                 "brand": brand if brand else None,
@@ -509,21 +811,33 @@ def main() -> None:
     else:  # Barcode Lookup
         st.header("Barcode Lookup")
         st.markdown("*Enter a UPC/EAN barcode to fetch nutrition data from Open Food Facts.*")
-        
+
+        if "barcode_lookup_input" not in st.session_state:
+            st.session_state["barcode_lookup_input"] = ""
+
+        quick_cols = st.columns(2)
+        with quick_cols[0]:
+            st.caption("Soda")
+            st.code("049000028904")
+        with quick_cols[1]:
+            st.caption("Bagels")
+            st.code("5000436049135")
+
         barcode = st.text_input(
             "Barcode",
-            value="",
+            key="barcode_lookup_input",
             placeholder="e.g., 078742101347",
             help="8, 12, 13, or 14 digit barcode"
         )
-        
-        if st.button("🔍 Lookup & Score", type="primary"):
+
+        lookup_clicked = st.button("Lookup & Score", type="primary")
+        if lookup_clicked:
             if not barcode or not barcode.isdigit():
                 st.error("Please enter a valid numeric barcode.")
             else:
                 with st.spinner("Fetching product data from Open Food Facts..."):
                     result = score_by_barcode(barcode, model, df_candidates)
-                
+
                 if "error" in result:
                     st.error(f"Error: {result['error']}")
                 else:
@@ -536,6 +850,37 @@ def main() -> None:
         render_result_columns(st.session_state["last_result"])
     else:
         display_alternatives_placeholder()
+
+    with st.expander("About This Model"):
+        st.caption(
+            f"Config: `{_APP_CFG_ARGS.config}`"
+            + (f" | Profile: `{_APP_CFG_ARGS.profile}`" if _APP_CFG_ARGS.profile else "")
+        )
+        if model_type == "unavailable":
+            st.error("Active model type could not be determined from artifacts.")
+        else:
+            st.caption(f"Active model type: `{model_type}`")
+        if metrics_timestamp:
+            st.caption(f"Latest metrics timestamp (UTC): `{metrics_timestamp}`")
+            if metrics_timestamp_source:
+                st.caption(f"Timestamp source: `{metrics_timestamp_source}`")
+        if metrics:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown("**Validation**")
+                st.json(metrics.get("validation", {}))
+            with col2:
+                st.markdown("**Test**")
+                st.json(metrics.get("test", {}))
+            with col3:
+                st.markdown("**Cross-Validation**")
+                st.json(metrics.get("cv", {}))
+            with col4:
+                st.markdown("**Recommendation Eval**")
+                if recommendation_eval:
+                    st.json(recommendation_eval)
+                else:
+                    st.caption("No recommendation eval found in model metadata.")
 
     # Footer
     st.divider()

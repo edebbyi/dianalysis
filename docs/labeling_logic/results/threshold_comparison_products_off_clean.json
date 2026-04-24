@@ -1,0 +1,62 @@
+{
+  "generated_at_utc": "2026-04-21T00:13:08.794730+00:00",
+  "dataset": {
+    "path": "/Users/esosa/Documents/GitHub/dianalysis/data/products_off_clean.csv",
+    "sha256": "ec8862f2c92d4184a36e5093696159eff486e980d12247767ccf6c4e60f8400b",
+    "row_count": 431,
+    "column_count": 21
+  },
+  "rulesets": {
+    "legacy": "`net>20,+2`; `add>=8,+2`; `sod>=500,+1`; `fiber>=5,-2`; `protein>=12,-1`",
+    "balanced_candidate": "`net>=25,+1`; `add>=10,+2`; `sod>=460,+1`; `fiber>=5.6,-2`; `protein>=10,-1`",
+    "current_adopted": "`carbs>=30,+2`; `add>=10,+2`; `sod>=460,+1`; `fiber>=5.6,-2`; `protein>=10,-1`"
+  },
+  "comparison_rows": [
+    {
+      "rule_id": "legacy",
+      "label": "Legacy rules (`net>20,+2`; `add>=8,+2`; `sod>=500,+1`; `fiber>=5,-2`; `protein>=12,-1`)",
+      "trigger": 2,
+      "positive_count": 178,
+      "total_count": 431,
+      "positive_rate": 41.29930394431555,
+      "positive_rate_pct": "41.30%"
+    },
+    {
+      "rule_id": "balanced_candidate",
+      "label": "Balanced rules (`net>=25,+1`; `add>=10,+2`; `sod>=460,+1`; `fiber>=5.6,-2`; `protein>=10,-1`)",
+      "trigger": 2,
+      "positive_count": 36,
+      "total_count": 431,
+      "positive_rate": 8.352668213457076,
+      "positive_rate_pct": "8.35%"
+    },
+    {
+      "rule_id": "balanced_candidate",
+      "label": "Balanced rules (same thresholds, stricter trigger)",
+      "trigger": 3,
+      "positive_count": 17,
+      "total_count": 431,
+      "positive_rate": 3.944315545243619,
+      "positive_rate_pct": "3.94%"
+    },
+    {
+      "rule_id": "current_adopted",
+      "label": "Current adopted rules (`carbs>=30,+2`; `add>=10,+2`; `sod>=460,+1`; `fiber>=5.6,-2`; `protein>=10,-1`)",
+      "trigger": 2,
+      "positive_count": 106,
+      "total_count": 431,
+      "positive_rate": 24.593967517401392,
+      "positive_rate_pct": "24.59%"
+    },
+    {
+      "rule_id": "current_adopted",
+      "label": "Current adopted rules (same thresholds, stricter trigger)",
+      "trigger": 3,
+      "positive_count": 24,
+      "total_count": 431,
+      "positive_rate": 5.56844547563805,
+      "positive_rate_pct": "5.57%"
+    }
+  ],
+  "command_hint": "python experiments/threshold_comparison.py --input-csv data/products_off_clean.csv --output-json docs/labeling_logic/results/threshold_comparison_products_off_clean.json --output-md docs/labeling_logic/results/threshold_comparison_products_off_clean.md"
+}

@@ -21,6 +21,7 @@ def index_dataframe(
     recreate: bool = False,
     prune_missing: bool = False,
     batch_size: int = 256,
+    sync_meta: dict | None = None,
 ) -> int:
     """Embed and upsert dataframe rows into Qdrant."""
     return _index_dataframe(
@@ -29,6 +30,7 @@ def index_dataframe(
         recreate=recreate,
         prune_missing=prune_missing,
         batch_size=batch_size,
+        sync_meta=sync_meta,
     )
 
 

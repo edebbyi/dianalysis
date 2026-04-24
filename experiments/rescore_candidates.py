@@ -10,45 +10,99 @@ Why:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from dianalysis.model import CAT_COLS, NUM_COLS, generate_synthetic_data, load_model, train_model
+from dianalysis.model import (
+    CAT_COLS,
+    NUM_COLS,
+    compute_model_fingerprint,
+    generate_synthetic_data,
+    load_model,
+    train_model,
+)
+from dianalysis.run_config import cfg_get, load_runtime_config, write_json
+from dianalysis.recommendation.candidate_pool import ensure_group_columns
 from dianalysis.scoring import format_risk_display
 from dianalysis.vector_retrieval import index_dataframe, retrieval_enabled
 
 
 def parse_args() -> argparse.Namespace:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", type=Path, default=Path("configs/base.toml"))
+    bootstrap.add_argument("--profile", type=Path, default=None)
+    bootstrap_args, _ = bootstrap.parse_known_args()
+    cfg = load_runtime_config(bootstrap_args.config, bootstrap_args.profile)
+
+    default_input = Path(str(cfg_get(cfg, "paths", "input_csv", default="data/products_off_clean.csv")))
+    default_output = Path(str(cfg_get(cfg, "paths", "scored_csv", default="data/products_off_clean_scored.csv")))
+    default_artifacts = str(cfg_get(cfg, "paths", "artifacts_dir", default="artifacts"))
+    default_train = bool(cfg_get(cfg, "training", "train_before_rescore", default=False))
+    default_auto_train = bool(cfg_get(cfg, "training", "auto_train_if_missing", default=False))
+    default_use_synth = bool(cfg_get(cfg, "training", "use_synthetic", default=False))
+    default_synth_n = int(cfg_get(cfg, "training", "synthetic_n", default=1000))
+    default_model_type = str(cfg_get(cfg, "model", "model_type", default="logreg"))
+    default_class_weight = str(cfg_get(cfg, "model", "class_weight", default="balanced"))
+    default_c = float(cfg_get(cfg, "model", "C", default=0.3))
+    default_missing_indicator = bool(cfg_get(cfg, "model", "with_missing_indicator", default=True))
+    default_cv_folds = int(cfg_get(cfg, "training", "cv_folds", default=5))
+    default_random_state = int(cfg_get(cfg, "project", "random_state", default=42))
+    default_xgb_n_estimators = int(cfg_get(cfg, "model", "xgb", "n_estimators", default=300))
+    default_xgb_max_depth = int(cfg_get(cfg, "model", "xgb", "max_depth", default=4))
+    default_xgb_learning_rate = float(cfg_get(cfg, "model", "xgb", "learning_rate", default=0.05))
+    default_xgb_subsample = float(cfg_get(cfg, "model", "xgb", "subsample", default=0.9))
+    default_xgb_colsample = float(cfg_get(cfg, "model", "xgb", "colsample_bytree", default=0.9))
+    default_qdrant_mode = str(cfg_get(cfg, "retrieval", "qdrant_mode", default="none"))
+
     parser = argparse.ArgumentParser(description="Refresh recommendation assets (optional train + rescore + index).")
-    parser.add_argument("--input-csv", type=Path, default=Path("data/products_off_clean.csv"))
-    parser.add_argument("--output-csv", type=Path, default=Path("data/products_off_clean_scored.csv"))
-    parser.add_argument("--artifacts-dir", type=str, default="artifacts")
-    parser.add_argument("--train", action="store_true", help="Train model before rescoring candidates.")
+    parser.add_argument("--config", type=Path, default=bootstrap_args.config)
+    parser.add_argument("--profile", type=Path, default=bootstrap_args.profile)
+    parser.add_argument("--input-csv", type=Path, default=default_input)
+    parser.add_argument("--output-csv", type=Path, default=default_output)
+    parser.add_argument("--artifacts-dir", type=str, default=default_artifacts)
+    parser.add_argument(
+        "--train",
+        action=argparse.BooleanOptionalAction,
+        default=default_train,
+        help="Train model before rescoring candidates.",
+    )
     parser.add_argument(
         "--auto-train-if-missing",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=default_auto_train,
         help="Train automatically only if model artifacts are missing.",
     )
-    parser.add_argument("--use-synthetic", action="store_true", help="Train using synthetic data.")
-    parser.add_argument("--synthetic-n", type=int, default=1000)
-    parser.add_argument("--model-type", choices=["logreg", "xgboost"], default="logreg")
-    parser.add_argument("--class-weight", type=str, default="balanced")
-    parser.add_argument("--C", type=float, default=0.3)
-    parser.add_argument("--with-missing-indicator", dest="with_missing_indicator", action="store_true", default=True)
+    parser.add_argument(
+        "--use-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=default_use_synth,
+        help="Train using synthetic data.",
+    )
+    parser.add_argument("--synthetic-n", type=int, default=default_synth_n)
+    parser.add_argument("--model-type", choices=["logreg", "xgboost"], default=default_model_type)
+    parser.add_argument("--class-weight", type=str, default=default_class_weight)
+    parser.add_argument("--C", type=float, default=default_c)
+    parser.add_argument(
+        "--with-missing-indicator",
+        dest="with_missing_indicator",
+        action="store_true",
+        default=default_missing_indicator,
+    )
     parser.add_argument("--no-missing-indicator", dest="with_missing_indicator", action="store_false")
-    parser.add_argument("--cv-folds", type=int, default=5)
-    parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--xgb-n-estimators", type=int, default=300)
-    parser.add_argument("--xgb-max-depth", type=int, default=4)
-    parser.add_argument("--xgb-learning-rate", type=float, default=0.05)
-    parser.add_argument("--xgb-subsample", type=float, default=0.9)
-    parser.add_argument("--xgb-colsample-bytree", type=float, default=0.9)
+    parser.add_argument("--cv-folds", type=int, default=default_cv_folds)
+    parser.add_argument("--random-state", type=int, default=default_random_state)
+    parser.add_argument("--xgb-n-estimators", type=int, default=default_xgb_n_estimators)
+    parser.add_argument("--xgb-max-depth", type=int, default=default_xgb_max_depth)
+    parser.add_argument("--xgb-learning-rate", type=float, default=default_xgb_learning_rate)
+    parser.add_argument("--xgb-subsample", type=float, default=default_xgb_subsample)
+    parser.add_argument("--xgb-colsample-bytree", type=float, default=default_xgb_colsample)
     parser.add_argument(
         "--qdrant-mode",
         choices=["none", "upsert", "recreate", "prune"],
-        default="none",
+        default=default_qdrant_mode,
         help="Qdrant index action after rescoring.",
     )
     return parser.parse_args()
@@ -63,13 +117,17 @@ def artifacts_exist(artifacts_dir: str) -> bool:
     return has_meta and (has_logreg or has_xgb)
 
 
-def score_candidates(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFrame:
-    """Score all candidate rows and append reusable risk columns."""
+def score_candidates(df: pd.DataFrame, artifacts_dir: str) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Score all candidate rows and append reusable risk + sync identity columns."""
     model, meta = load_model(artifacts_dir)
-    model_type = str(meta.get("model_type", "unknown"))
-    print(f"Loaded model from '{artifacts_dir}' (model_type={model_type})")
+    model_type = str(meta.get("model_type", "unknown")).strip().lower()
+    model_fingerprint = compute_model_fingerprint(artifacts_dir, meta=meta)
+    scored_at_utc = pd.Timestamp.now(tz="UTC").isoformat()
+    print(
+        f"Loaded model from '{artifacts_dir}' (model_type={model_type}, fingerprint={model_fingerprint[:12]}...)"
+    )
 
-    out = df.copy()
+    out = ensure_group_columns(df)
     if "alt_group" not in out.columns and "category" in out.columns:
         out["alt_group"] = out["category"]
 
@@ -78,7 +136,14 @@ def score_candidates(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFrame:
     out["risk_prob"] = probs
     out["risk_score"] = (out["risk_prob"] * 100).round().astype(int)
     out["risk_display"] = out["risk_prob"].apply(format_risk_display)
-    return out
+    out["model_type"] = model_type
+    out["model_fingerprint"] = model_fingerprint
+    out["scored_at_utc"] = scored_at_utc
+    return out, {
+        "model_type": model_type,
+        "model_fingerprint": model_fingerprint,
+        "scored_at_utc": scored_at_utc,
+    }
 
 
 def maybe_train(args: argparse.Namespace) -> None:
@@ -126,13 +191,26 @@ def maybe_train(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    cfg = load_runtime_config(args.config, args.profile)
+    os.environ["DIANALYSIS_CONFIG"] = str(args.config)
+    if args.profile:
+        os.environ["DIANALYSIS_PROFILE"] = str(args.profile)
+    else:
+        os.environ.pop("DIANALYSIS_PROFILE", None)
+    print(
+        {
+            "config_path": str(args.config),
+            "profile_path": (str(args.profile) if args.profile else None),
+            "config_loaded": bool(cfg),
+        }
+    )
     if not args.input_csv.exists():
         raise FileNotFoundError(f"Input CSV not found: {args.input_csv}")
 
     maybe_train(args)
 
     df = pd.read_csv(args.input_csv, dtype={"upc": str})
-    scored = score_candidates(df, artifacts_dir=args.artifacts_dir)
+    scored, sync_meta = score_candidates(df, artifacts_dir=args.artifacts_dir)
 
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     scored.to_csv(args.output_csv, index=False)
@@ -142,11 +220,43 @@ def main() -> None:
         if retrieval_enabled():
             recreate = args.qdrant_mode == "recreate"
             prune_missing = args.qdrant_mode == "prune"
-            n = index_dataframe(scored, recreate=recreate, prune_missing=prune_missing)
+            n = index_dataframe(scored, recreate=recreate, prune_missing=prune_missing, sync_meta=sync_meta)
             action = "recreated" if recreate else ("upserted+pruned" if prune_missing else "upserted")
             print(f"Qdrant index {action} with {n} rows.")
         else:
             print("Skipped Qdrant indexing (retrieval backend is not set to qdrant).")
+
+    snapshot_path = Path(
+        str(cfg_get(cfg, "paths", "rescore_resolved_config", default="reports/rescore_resolved_config.json"))
+    )
+    write_json(
+        snapshot_path,
+        {
+            "sources": {
+                "config": str(args.config),
+                "profile": (str(args.profile) if args.profile else None),
+            },
+            "cli_args": vars(args),
+            "resolved_config": cfg,
+            "rescore_invocation": {
+                "input_csv": str(args.input_csv),
+                "output_csv": str(args.output_csv),
+                "artifacts_dir": str(args.artifacts_dir),
+                "train": bool(args.train),
+                "auto_train_if_missing": bool(args.auto_train_if_missing),
+                "use_synthetic": bool(args.use_synthetic),
+                "synthetic_n": int(args.synthetic_n),
+                "model_type": str(args.model_type),
+                "class_weight": str(args.class_weight),
+                "C": float(args.C),
+                "with_missing_indicator": bool(args.with_missing_indicator),
+                "cv_folds": int(args.cv_folds),
+                "random_state": int(args.random_state),
+                "qdrant_mode": str(args.qdrant_mode),
+            },
+        },
+    )
+    print(f"Wrote resolved config snapshot -> {snapshot_path}")
 
 
 if __name__ == "__main__":

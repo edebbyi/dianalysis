@@ -1,4 +1,7 @@
 [core]
-    remote = localstore
+    remote = b2
 ['remote "localstore"']
     url = ../.dvcstore
+['remote "b2"']
+    url = s3://dianalysis
+    endpointurl = https://s3.us-east-005.backblazeb2.com

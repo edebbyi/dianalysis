@@ -8,7 +8,12 @@ Why:
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol
+
+try:
+    from typing import TypeAlias
+except ImportError:  # pragma: no cover - Python <3.10 fallback
+    from typing_extensions import TypeAlias
 
 import numpy as np
 import pandas as pd

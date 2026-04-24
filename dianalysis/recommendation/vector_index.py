@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from .candidate_pool import ensure_group_columns
 from .vector_client import (
     collection_name,
     embedder,
@@ -22,12 +23,15 @@ def embedding_text_for_item(item: dict[str, Any]) -> str:
     name = str(item.get("name", "") or "").strip()
     brand = str(item.get("brand", "") or "").strip()
     category = str(item.get("category", "") or "").strip()
+    category_main = str(item.get("category_main", "") or category).strip()
     alt_group = str(item.get("alt_group", "") or "").strip()
+    alt_group_fine = str(item.get("alt_group_fine", "") or "").strip()
     categories_all = str(item.get("categories_all", "") or "").strip()
     ingredients = str(item.get("ingredients_text", "") or "").strip()
     return (
-        f"name: {name} | brand: {brand} | category: {category} | "
-        f"group: {alt_group} | categories: {categories_all} | ingredients: {ingredients}"
+        f"name: {name} | brand: {brand} | category: {category} | category_main: {category_main} | "
+        f"group: {alt_group} | fine_group: {alt_group_fine} | "
+        f"categories: {categories_all} | ingredients: {ingredients}"
     )
 
 
@@ -93,6 +97,7 @@ def index_dataframe(
     recreate: bool = False,
     prune_missing: bool = False,
     batch_size: int = 256,
+    sync_meta: dict[str, Any] | None = None,
 ) -> int:
     """Embed and upsert dataframe rows into Qdrant."""
     if not retrieval_enabled():
@@ -110,6 +115,7 @@ def index_dataframe(
     ensure_collection_exists(target)
 
     work = df.copy()
+    work = ensure_group_columns(work)
     work["_product_key"] = work.apply(lambda r: product_key(r.to_dict()), axis=1)
     work["_point_id"] = work["_product_key"].apply(stable_point_id)
     texts = [embedding_text_for_item(row.to_dict()) for _, row in work.iterrows()]
@@ -124,8 +130,17 @@ def index_dataframe(
             payload = {
                 "product_key": str(row.get("_product_key", "") or ""),
                 "category": str(row.get("category", "") or ""),
+                "category_main": str(row.get("category_main", row.get("category", "")) or ""),
                 "alt_group": str(row.get("alt_group", "") or ""),
+                "alt_group_fine": str(row.get("alt_group_fine", "") or ""),
             }
+            if sync_meta:
+                if "model_type" in sync_meta:
+                    payload["model_type"] = str(sync_meta.get("model_type", "") or "")
+                if "model_fingerprint" in sync_meta:
+                    payload["model_fingerprint"] = str(sync_meta.get("model_fingerprint", "") or "")
+                if "scored_at_utc" in sync_meta:
+                    payload["scored_at_utc"] = str(sync_meta.get("scored_at_utc", "") or "")
             points.append(
                 qmodels.PointStruct(
                     id=int(row["_point_id"]),

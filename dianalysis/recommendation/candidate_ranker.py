@@ -6,13 +6,14 @@ import re
 
 import pandas as pd
 
-from .config import DEFAULT_RANKING_WEIGHTS, TEXT_STOPWORDS
+from .config import get_ranking_weights, get_text_stopwords
 
 
 def token_set(text: str) -> set[str]:
     """Tokenize text into normalized words for overlap checks."""
+    stopwords = get_text_stopwords()
     toks = {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 2}
-    return {t for t in toks if t not in TEXT_STOPWORDS}
+    return {t for t in toks if t not in stopwords}
 
 
 def ingredient_overlap_score(query_ingredients: str, candidate_ingredients: str) -> float:
@@ -34,15 +35,18 @@ def rank_candidates(
     fiber_this: float,
     cat: str,
     group_key: str,
+    fine_group_key: str,
     name_text: str,
     query_ingredients: str,
     k: int,
 ) -> pd.DataFrame:
     """Rank candidates by blended similarity, health, and alignment signals."""
-    cfg = DEFAULT_RANKING_WEIGHTS
+    cfg = get_ranking_weights()
     out = cand.copy()
 
-    out["delta_net"] = this_net - out["net_carbs_g"].astype(float)
+    out["net_carbs_g"] = pd.to_numeric(out["net_carbs_g"], errors="coerce").fillna(float("inf"))
+    out["risk_score"] = pd.to_numeric(out["risk_score"], errors="coerce").fillna(100.0)
+    out["delta_net"] = this_net - out["net_carbs_g"]
     out["sugar_g"] = pd.to_numeric(out["sugar_g"], errors="coerce").fillna(float("inf"))
     out["fiber_g"] = pd.to_numeric(out["fiber_g"], errors="coerce").fillna(0.0)
 
@@ -59,7 +63,8 @@ def rank_candidates(
     out["similarity_score"] = pd.to_numeric(retrieval_col, errors="coerce").fillna(0.0)
     out["similarity_score"] = ((out["similarity_score"] + 1.0) / 2.0).clip(0.0, 1.0)
 
-    risk_norm = (1.0 - (pd.to_numeric(out["risk_score"], errors="coerce").fillna(10.0) / 10.0)).clip(0.0, 1.0)
+    # risk_score is 0-100; normalize to [0, 1] where higher means healthier.
+    risk_norm = (1.0 - (pd.to_numeric(out["risk_score"], errors="coerce").fillna(100.0) / 100.0)).clip(0.0, 1.0)
     net_improve = (out["delta_net"].clip(lower=0.0) / (abs(float(this_net)) + 1.0)).clip(0.0, 1.0)
     sugar_improve = ((float(sugar_this) - out["sugar_g"]).clip(lower=0.0) / (abs(float(sugar_this)) + 1.0)).clip(0.0, 1.0)
     fiber_improve = ((out["fiber_g"] - float(fiber_this)).clip(lower=0.0) / (abs(float(fiber_this)) + 1.0)).clip(0.0, 1.0)
@@ -68,14 +73,22 @@ def rank_candidates(
     )
 
     cand_group = out["alt_group"].fillna(out["category"]).astype(str).str.lower()
-    cand_cat = out["category"].fillna("").astype(str).str.lower()
+    cat_main_series = out.get("category_main", out["category"])
+    cand_cat_main = cat_main_series.fillna(out["category"]).astype(str).str.lower()
+    fine_series = out.get("alt_group_fine", pd.Series("", index=out.index))
+    cand_fine = fine_series.fillna("").astype(str).str.lower()
     query_group = str(group_key).lower()
     query_cat = str(cat).lower()
+    query_fine = str(fine_group_key).lower()
     out["category_penalty"] = cfg.cross_category_penalty
-    out.loc[cand_cat == query_cat, "category_penalty"] = cfg.same_category_penalty
+    out.loc[cand_cat_main == query_cat, "category_penalty"] = cfg.same_category_penalty
     out.loc[cand_group == query_group, "category_penalty"] = 0.00
 
     out["stage_penalty"] = out["stage_rank"] * cfg.stage_penalty_step
+    out["subtype_bonus"] = (cand_fine == query_fine).astype(float) * 0.20
+    out["subtype_penalty"] = (
+        (cand_cat_main == query_cat) & (cand_fine != "") & (cand_fine != query_fine)
+    ).astype(float) * 0.12
 
     query_tokens = token_set(name_text)
     categories_all = out["categories_all"] if "categories_all" in out.columns else pd.Series("", index=out.index)
@@ -90,14 +103,20 @@ def rank_candidates(
     out["ingredient_score"] = ingredients_text.fillna("").astype(str).apply(
         lambda s: ingredient_overlap_score(query_ingredients, s)
     )
+    out["ingredient_score"] = pd.to_numeric(out["ingredient_score"], errors="coerce").fillna(0.0)
+    out["similarity_score"] = pd.to_numeric(out["similarity_score"], errors="coerce").fillna(0.0)
+    out["health_score"] = pd.to_numeric(out["health_score"], errors="coerce").fillna(0.0)
+    out["text_align_score"] = pd.to_numeric(out["text_align_score"], errors="coerce").fillna(0.0)
 
     out["final_score"] = (
         (cfg.similarity_alpha * out["similarity_score"])
         + (cfg.health_beta * out["health_score"])
         + (cfg.text_align_gamma * out["text_align_score"])
         + (cfg.ingredient_gamma * out["ingredient_score"])
+        + out["subtype_bonus"]
         - out["category_penalty"]
         - out["stage_penalty"]
+        - out["subtype_penalty"]
     )
 
     return out.sort_values(
@@ -112,7 +131,7 @@ def rank_candidates(
             "improves_sugar",
         ],
         ascending=[False, True, False, True, False, False, False, False],
-    ).head(k)
+    )
 
 
 def format_alternatives(cand: pd.DataFrame, *, this_net: float, fiber_this: float) -> list[dict]:
@@ -133,7 +152,9 @@ def format_alternatives(cand: pd.DataFrame, *, this_net: float, fiber_this: floa
                 "name": r.get("name", f"Alt {i + 1}"),
                 "brand": r.get("brand"),
                 "category": r["category"],
+                "category_main": r.get("category_main", r.get("category")),
                 "alt_group": r.get("alt_group"),
+                "alt_group_fine": r.get("alt_group_fine"),
                 "risk_score": int(r["risk_score"]),
                 "risk_display": r["risk_display"],
                 "fiber_g": float(r.get("fiber_g", 0.0) or 0.0),
