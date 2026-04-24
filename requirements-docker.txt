@@ -8,8 +8,5 @@ matplotlib>=3.8
 requests>=2.31
 xgboost==1.7.6
 dvc==3.67.1
-shap>=0.41
-mlflow>=2.15
-ruff>=0.6
 qdrant-client>=1.10
 sentence-transformers>=3.0

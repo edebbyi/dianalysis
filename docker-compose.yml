@@ -1,0 +1,81 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        REQUIREMENTS_FILE: requirements-docker.txt
+        EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        PRELOAD_EMBED_MODEL: ${PRELOAD_EMBED_MODEL:-1}
+        TORCH_VERSION: ${DIANALYSIS_TORCH_VERSION:-2.5.1+cpu}
+        TORCH_INDEX_URL: ${DIANALYSIS_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    ports:
+      - "8501:8501"
+    environment:
+      DIANALYSIS_CONFIG: ${DIANALYSIS_CONFIG:-configs/base.toml}
+      DIANALYSIS_PROFILE: ${DIANALYSIS_PROFILE:-}
+      DIANALYSIS_EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      HF_HOME: /root/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+  app-dev:
+    build:
+      context: .
+      args:
+        REQUIREMENTS_FILE: requirements-docker.txt
+        EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        PRELOAD_EMBED_MODEL: ${PRELOAD_EMBED_MODEL:-1}
+        TORCH_VERSION: ${DIANALYSIS_TORCH_VERSION:-2.5.1+cpu}
+        TORCH_INDEX_URL: ${DIANALYSIS_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    ports:
+      - "8501:8501"
+    environment:
+      DIANALYSIS_CONFIG: ${DIANALYSIS_CONFIG:-configs/base.toml}
+      DIANALYSIS_PROFILE: ${DIANALYSIS_PROFILE:-}
+      DIANALYSIS_EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      HF_HOME: /root/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true --server.fileWatcherType=poll
+  ops:
+    build:
+      context: .
+      args:
+        REQUIREMENTS_FILE: requirements-docker.txt
+        EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        PRELOAD_EMBED_MODEL: ${PRELOAD_EMBED_MODEL:-1}
+        TORCH_VERSION: ${DIANALYSIS_TORCH_VERSION:-2.5.1+cpu}
+        TORCH_INDEX_URL: ${DIANALYSIS_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    environment:
+      DIANALYSIS_CONFIG: ${DIANALYSIS_CONFIG:-configs/base.toml}
+      DIANALYSIS_PROFILE: ${DIANALYSIS_PROFILE:-}
+      DIANALYSIS_EMBED_MODEL: ${DIANALYSIS_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      DIANALYSIS_RETRIEVAL_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      HF_HOME: /root/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      - qdrant
+    command: python -V
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  hf_cache:
+  qdrant_storage:

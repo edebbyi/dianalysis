@@ -1,0 +1,18 @@
+common:
+  config: configs/base.toml
+  profile: configs/profiles/xgboost.toml
+
+train:
+  random_state: 42
+  cv_folds: 5
+
+rescore:
+  input_csv: data/products_off_clean.csv
+  output_csv: data/products_off_clean_scored.csv
+  qdrant_mode: none
+
+quality_gate:
+  data: data/products_off_clean.csv
+  cv_folds: 5
+  sample_size: 120
+  report_path: reports/model_quality_report.json

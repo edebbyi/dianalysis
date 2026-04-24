@@ -1,0 +1,61 @@
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python caches/bytecode
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test/coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime artifacts and experiment outputs
+artifacts/
+artifacts_tmp/
+artifacts_xgb*/
+mlruns/
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+reports/
+tmp_*.json
+docs/release_plan_v1.2.md
+docs/grounding/results/category_label_audit_products_off_clean.md
+docs/labeling_logic/results/category_label_audit_products_off_clean.md
+
+# Optional generated datasets (keep raw/source files as needed)
+data/*_scored*.csv
+archive/
+
+# Local-only module no longer used
+dianalysis/candidate_fixtures.py
+
+# Local DVC remote storage
+.dvcstore/
