@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from .candidate_pool import CHIP_KEYWORDS, COOKIE_KEYWORDS, text_contains_any
+from .candidate_pool import (
+    DAIRY_DRINK_KEYWORDS,
+    JUICE_KEYWORDS,
+    SOFT_DRINK_KEYWORDS,
+    WATER_KEYWORDS,
+)
 
 
 def select_stage_candidates(
@@ -51,10 +59,50 @@ def select_stage_candidates(
     return cand
 
 
-def apply_style_filters(cand: pd.DataFrame, *, group_key: str, name_text: str) -> pd.DataFrame:
+def apply_style_filters(
+    cand: pd.DataFrame, *, group_key: str, name_text: str, fine_group_key: str = ""
+) -> pd.DataFrame:
     """Filter snack results by chip-like or cookie-like query style."""
     out = cand
-    if group_key != "snack" or out.empty:
+    if out.empty:
+        return out
+
+    if group_key == "drink":
+        out["_drink_text"] = (
+            out["name"].fillna("").astype(str)
+            + " "
+            + out["brand"].fillna("").astype(str)
+            + " "
+            + out["categories_all"].fillna("").astype(str)
+        ).str.lower()
+
+        normalized_fine = str(fine_group_key or "").strip().lower()
+        wants_soft_drink = (normalized_fine == "drink:soft_drink") or text_contains_any(name_text, SOFT_DRINK_KEYWORDS)
+        wants_water = (normalized_fine == "drink:water") or text_contains_any(name_text, WATER_KEYWORDS)
+        wants_juice = (normalized_fine == "drink:juice") or text_contains_any(name_text, JUICE_KEYWORDS)
+
+        if wants_soft_drink:
+            # For soda/cola queries, prefer soda-like swaps and avoid
+            # jumping to water or dairy drinks unless no soda-like rows exist.
+            out["_is_soft"] = out["_drink_text"].apply(lambda t: text_contains_any(t, SOFT_DRINK_KEYWORDS))
+            out["_is_water_like"] = out["_drink_text"].apply(lambda t: text_contains_any(t, WATER_KEYWORDS))
+            out["_is_dairy_like"] = out["_drink_text"].apply(lambda t: text_contains_any(t, DAIRY_DRINK_KEYWORDS))
+            out = out[out["_is_soft"] & (~out["_is_water_like"]) & (~out["_is_dairy_like"])]
+            return out.drop(columns=["_drink_text", "_is_soft", "_is_water_like", "_is_dairy_like"], errors="ignore")
+
+        if wants_water:
+            out["_is_water"] = out["_drink_text"].apply(lambda t: text_contains_any(t, WATER_KEYWORDS))
+            out = out[out["_is_water"]]
+            return out.drop(columns=["_drink_text", "_is_water"], errors="ignore")
+
+        if wants_juice:
+            out["_is_juice"] = out["_drink_text"].apply(lambda t: text_contains_any(t, JUICE_KEYWORDS))
+            out = out[out["_is_juice"]]
+            return out.drop(columns=["_drink_text", "_is_juice"], errors="ignore")
+
+        return out.drop(columns=["_drink_text"], errors="ignore")
+
+    if group_key != "snack":
         return out
 
     wants_chip = text_contains_any(name_text, CHIP_KEYWORDS)
@@ -90,10 +138,18 @@ def apply_style_filters(cand: pd.DataFrame, *, group_key: str, name_text: str) -
 def drop_duplicate_candidates(cand: pd.DataFrame) -> pd.DataFrame:
     """Drop duplicate rows by normalized name and brand."""
     out = cand.copy()
-    out["_name_norm"] = out["name"].fillna("").str.lower().str.strip()
-    out["_brand_norm"] = out["brand"].fillna("").str.lower().str.strip()
-    out = out.drop_duplicates(subset=["_name_norm", "_brand_norm"]) 
-    return out.drop(columns=["_name_norm", "_brand_norm"])
+    if "upc" in out.columns:
+        out["_upc_norm"] = out["upc"].fillna("").astype(str).str.strip()
+        out = out[(out["_upc_norm"] == "") | (~out["_upc_norm"].duplicated(keep="first"))]
+
+    def _canon_text(val: object) -> str:
+        text = str(val or "").lower().strip()
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    out["_name_norm"] = out["name"].fillna("").apply(_canon_text)
+    out["_brand_norm"] = out["brand"].fillna("").apply(_canon_text)
+    out = out.drop_duplicates(subset=["_name_norm", "_brand_norm"], keep="first")
+    return out.drop(columns=["_name_norm", "_brand_norm", "_upc_norm"], errors="ignore")
 
 
 def apply_group_priority(cand: pd.DataFrame, *, group_key: str) -> pd.DataFrame:

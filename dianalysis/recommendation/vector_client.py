@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from importlib.util import find_spec
+from typing import Any
 
 try:  # optional dependency
     from qdrant_client import QdrantClient
     from qdrant_client.http import models as qmodels
 except Exception:  # pragma: no cover
-    QdrantClient = None  # type: ignore[assignment]
-    qmodels = None  # type: ignore[assignment]
-
-try:  # optional dependency
-    from sentence_transformers import SentenceTransformer
-except Exception:  # pragma: no cover
-    SentenceTransformer = None  # type: ignore[assignment]
-
+    QdrantClient = None
+    qmodels = None
 
 DEFAULT_COLLECTION = "dianalysis_products"
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -37,10 +33,25 @@ def qdrant_url() -> str:
     return os.getenv("QDRANT_URL", "http://localhost:6333")
 
 
+def qdrant_api_key() -> str:
+    """Return optional Qdrant API key from environment."""
+    return str(
+        os.getenv("QDRANT_API_KEY", "") or os.getenv("DIANALYSIS_QDRANT_API_KEY", "")
+    ).strip()
+
+
 def retrieval_enabled() -> bool:
     """Return True when semantic retrieval is enabled and deps exist."""
-    backend = os.getenv("DIANALYSIS_RETRIEVAL_BACKEND", "heuristic").strip().lower()
-    return backend == "qdrant" and QdrantClient is not None and SentenceTransformer is not None
+    backend = os.getenv("DIANALYSIS_RETRIEVAL_BACKEND", "qdrant").strip().lower()
+    return backend == "qdrant" and QdrantClient is not None and find_spec("sentence_transformers") is not None
+
+
+@lru_cache(maxsize=1)
+def _sentence_transformer_class() -> Any:
+    """Import sentence-transformers lazily so heuristic paths stay lightweight."""
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer
 
 
 @lru_cache(maxsize=1)
@@ -48,15 +59,18 @@ def qdrant_client() -> QdrantClient:
     """Create one cached Qdrant client."""
     if QdrantClient is None:  # pragma: no cover
         raise RuntimeError("qdrant-client is not installed")
+    key = qdrant_api_key()
+    if key:
+        return QdrantClient(url=qdrant_url(), api_key=key)
     return QdrantClient(url=qdrant_url())
 
 
 @lru_cache(maxsize=1)
-def embedder() -> SentenceTransformer:
+def embedder() -> Any:
     """Create one cached sentence-transformer embedder."""
-    if SentenceTransformer is None:  # pragma: no cover
+    if find_spec("sentence_transformers") is None:  # pragma: no cover
         raise RuntimeError("sentence-transformers is not installed")
-    return SentenceTransformer(model_name())
+    return _sentence_transformer_class()(model_name())
 
 
 def embedding_dimension() -> int:

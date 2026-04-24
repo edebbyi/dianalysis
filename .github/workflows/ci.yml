@@ -7,6 +7,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      DIANALYSIS_CONFIG: configs/base.toml
 
     steps:
       - name: Checkout
@@ -16,11 +20,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install mypy
 
       - name: Compile check
         run: |
@@ -32,17 +38,37 @@ jobs:
 
       - name: Mypy type check
         run: |
-          pip install mypy
           mypy
 
       - name: Run tests
         run: |
           python -m unittest discover -s tests -p "test_*.py"
 
-      - name: Train smoke test
+      - name: Train Smoke (Config + Profile)
         run: |
-          python train.py
+          mkdir -p artifacts reports
+          python train.py \
+            --config configs/base.toml \
+            --profile configs/profiles/xgboost.toml \
+            --use-synthetic \
+            --synthetic-n 300 \
+            --cv-folds 3
 
-      - name: Model quality gate
+      - name: Rescore Smoke (Config + Profile)
         run: |
-          python experiments/model_quality_gate.py
+          python experiments/rescore_candidates.py \
+            --config configs/base.toml \
+            --profile configs/profiles/xgboost.toml \
+            --input-csv data/products_off_clean.csv \
+            --output-csv reports/ci_products_off_clean_scored.csv \
+            --no-train \
+            --no-auto-train-if-missing
+
+      - name: Model Quality Gate (Config)
+        run: |
+          python experiments/model_quality_gate.py \
+            --config configs/base.toml \
+            --profile configs/profiles/xgboost.toml \
+            --data data/products_off_clean.csv \
+            --cv-folds 3 \
+            --report-path reports/model_quality_report_ci.json

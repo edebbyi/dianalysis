@@ -1,0 +1,68 @@
+[project]
+name = "dianalysis"
+random_state = 42
+
+[paths]
+input_csv = "data/products_off_clean.csv"
+scored_csv = "data/products_off_clean_scored.csv"
+artifacts_dir = "artifacts"
+quality_report = "reports/model_quality_report.json"
+train_resolved_config = "artifacts/run_configs/train_resolved_config.json"
+rescore_resolved_config = "reports/rescore_resolved_config.json"
+quality_resolved_config = "reports/model_quality_resolved_config.json"
+
+[model]
+model_type = "logreg"
+class_weight = "balanced"
+C = 0.3
+with_missing_indicator = true
+
+[model.xgb]
+n_estimators = 300
+max_depth = 4
+learning_rate = 0.05
+subsample = 0.9
+colsample_bytree = 0.9
+
+[training]
+cv_folds = 5
+test_size = 0.2
+val_size = 0.2
+use_synthetic = false
+synthetic_n = 1000
+train_before_rescore = false
+auto_train_if_missing = false
+
+[quality_gate]
+min_test_f1 = 0.60
+min_test_auprc = 0.75
+max_test_brier = 0.03
+min_ndcg = 0.80
+min_coverage = 0.80
+ndcg_k = 3
+sample_size = 120
+
+[recommendation]
+k = 3
+
+[recommendation.weights]
+similarity_alpha = 0.35
+health_beta = 0.65
+text_align_gamma = 0.20
+ingredient_gamma = 0.20
+same_category_penalty = 0.20
+cross_category_penalty = 0.85
+stage_penalty_step = 0.05
+
+[retrieval]
+backend = "qdrant"
+qdrant_url = "http://localhost:6333"
+qdrant_collection = "dianalysis_products"
+embed_model = "sentence-transformers/all-MiniLM-L6-v2"
+qdrant_mode = "none"
+
+[off_api]
+base_url = "https://world.openfoodfacts.org"
+request_timeout_sec = 30
+retry_total = 5
+retry_backoff = 0.7

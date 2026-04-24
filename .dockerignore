@@ -23,3 +23,8 @@ mlflow.db-shm
 mlflow.db-wal
 reports/
 tmp_*.json
+tests/
+assets/
+*.ipynb
+README.md
+LICENSE

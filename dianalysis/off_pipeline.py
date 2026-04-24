@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import copy
+import os
 import re
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Sequence, cast
 
 import requests
@@ -12,9 +16,29 @@ from datetime import datetime, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .run_config import cfg_get, load_runtime_config
+from .recommendation.candidate_pool import ensure_row_group_fields
+
 
 # Configuration
-OFF_URL = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
+_RUNTIME_CFG = load_runtime_config(
+    Path(os.getenv("DIANALYSIS_CONFIG", "configs/base.toml")),
+    (Path(os.environ["DIANALYSIS_PROFILE"]) if os.getenv("DIANALYSIS_PROFILE") else None),
+)
+OFF_BASE_URL = str(cfg_get(_RUNTIME_CFG, "off_api", "base_url", default="https://world.openfoodfacts.org")).rstrip("/")
+OFF_REQUEST_TIMEOUT_SEC = int(cfg_get(_RUNTIME_CFG, "off_api", "request_timeout_sec", default=30))
+OFF_RETRY_TOTAL = int(cfg_get(_RUNTIME_CFG, "off_api", "retry_total", default=5))
+OFF_RETRY_BACKOFF = float(cfg_get(_RUNTIME_CFG, "off_api", "retry_backoff", default=0.7))
+OFF_FALLBACK_BASE_URLS = tuple(
+    dict.fromkeys(
+        [
+            OFF_BASE_URL,
+            "https://world.openfoodfacts.org",
+            "https://us.openfoodfacts.org",
+        ]
+    )
+)
+OFF_PRODUCT_API_PATHS = ("/api/v2/product/{barcode}.json", "/api/v0/product/{barcode}.json")
 
 # Display rules (units + trace thresholds)
 DISPLAY_RULES = {
@@ -39,7 +63,7 @@ OFF_TAGS_MULTI = {
     "snack": ["snacks", "chips", "crisps", "tortilla-chips", "pretzel"],
     "ice-cream": ["ice-creams", "ice-cream", "frozen-desserts"],
     "bread": ["breads", "bread", "bakery", "bagels", "tortillas", "flatbreads", "wraps", "buns", "rolls", "pita", "naan", "ciabatta"],
-    "drink": ["beverages", "drinks", "soft-drinks", "juices", "water"],
+    "drink": ["beverages", "beverage", "drinks", "drink", "soft-drinks", "soft-drink", "sodas", "soda", "colas", "cola", "juices", "juice", "water"],
 }
 
 # Canonical category for each alt_group
@@ -63,7 +87,17 @@ ALT_KEYWORDS = {
               r"\bbun(s)?\b", r"\broll(s)?\b", r"\bpita\b", r"\bnaan\b", r"\bciabatta\b"],
     "snack": [r"\bchips?\b", r"\bcrisps?\b", r"\bnacho(s)?\b", r"\btortilla chips\b", r"\bsnack\b", r"\bpretzel(s)?\b"],
     "ice-cream": [r"\bice[- ]?cream\b", r"\bfrozen dessert\b"],
-    "drink": [r"\bbeverage(s)?\b", r"\bdrink(s)?\b", r"\bwater\b", r"\bjuice(s)?\b", r"\bsoft[- ]?drink(s)?\b", r"\bsoda(s)?\b"],
+    "drink": [
+        r"\bbeverage(s)?\b",
+        r"\bdrink(s)?\b",
+        r"\bwater\b",
+        r"\bjuice(s)?\b",
+        r"\bsoft[- ]?drink(s)?\b",
+        r"\bsoda(s)?\b",
+        r"\bcola(s)?\b",
+        r"\bcoke\b",
+        r"\bpop\b",
+    ],
 }
 
 # Negative keywords to filter out wrong items
@@ -77,6 +111,7 @@ NEGATIVE_KEYWORDS = {
     "cereal": [r"\bsoup\b", r"\bnoodle(s)?\b", r"\brice\b"],
     "ice-cream": [r"\bsoup\b", r"\bwater\b", r"\bnoodle(s)?\b"],
     "drink": [r"\bsoup\b", r"\bnoodle(s)?\b", r"\bpasta\b", r"\brice\b", r"\bice[- ]?cream\b"],
+    "snack": [r"\b(water|beverage|drink|soda|cola|juice)\b"],
 }
 
 TARGET_GROUPS = set(OFF_TAGS_MULTI.keys())
@@ -123,8 +158,12 @@ def compute_net_carbs_local(row: dict) -> float:
 def make_session() -> requests.Session:
     """Create an HTTP session with retry and backoff settings."""
     s = requests.Session()
+    connect_retry = max(0, OFF_RETRY_TOTAL - 1)
     retries = Retry(
-        total=5, connect=4, read=4, backoff_factor=0.7,
+        total=OFF_RETRY_TOTAL,
+        connect=connect_retry,
+        read=connect_retry,
+        backoff_factor=OFF_RETRY_BACKOFF,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"])
     )
@@ -137,17 +176,31 @@ def make_session() -> requests.Session:
 SESSION = make_session()
 
 
-def safe_get(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> requests.Response:
+def safe_get(url: str, params: dict[str, Any] | None = None, timeout: int | None = None) -> requests.Response:
     """Send a GET request through the shared retry-enabled session."""
-    return SESSION.get(url, params=params, timeout=timeout)
+    return SESSION.get(url, params=params, timeout=(timeout or OFF_REQUEST_TIMEOUT_SEC))
 
 
 # OFF data extraction helpers
 def extract_categories(product: dict[str, Any]) -> list[str]:
     """Read category tags from an OFF product and normalize them to lowercase."""
     raw = product.get("categories_hierarchy") or product.get("categories_tags") or []
+    raw_list: list[str]
+    if isinstance(raw, str):
+        raw_list = [x.strip() for x in raw.split(",") if x and x.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        raw_list = [str(x) for x in raw]
+    else:
+        raw_list = []
+
+    # Some OFF responses only include plain category text.
+    if not raw_list:
+        fallback_text = product.get("categories") or product.get("categories_en") or ""
+        if isinstance(fallback_text, str):
+            raw_list = [x.strip() for x in fallback_text.split(",") if x and x.strip()]
+
     cats = []
-    for c in raw:
+    for c in raw_list:
         try:
             s = str(c).strip().lower()
             if not s:
@@ -155,6 +208,11 @@ def extract_categories(product: dict[str, Any]) -> list[str]:
             if ":" in s:
                 s = s.split(":")[-1]
             cats.append(s)
+            # Normalize common separators so matching catches "soft drinks" and "soft_drinks".
+            if " " in s:
+                cats.append(s.replace(" ", "-"))
+            if "_" in s:
+                cats.append(s.replace("_", "-"))
         except Exception:
             continue
     return cats
@@ -228,8 +286,8 @@ def get_calories(nutriments: dict[str, Any], serving_g: float) -> float:
     return float(kj) * 0.239006 if kj is not None else 0.0
 
 
-def get_sodium_mg(nutriments: dict[str, Any], serving_g: float) -> float:
-    """Return sodium per serving in milligrams."""
+def get_sodium_mg(nutriments: dict[str, Any], serving_g: float) -> float | None:
+    """Return sodium per serving in milligrams, or None when unavailable."""
     unit = (nutriments or {}).get("sodium_unit", "g")
     if (nutriments or {}).get("sodium_serving") is not None:
         val = float(nutriments["sodium_serving"])
@@ -240,7 +298,7 @@ def get_sodium_mg(nutriments: dict[str, Any], serving_g: float) -> float:
     salt = get_nutrient(nutriments, "salt", serving_g, None)
     if salt is not None:
         return float(salt) * 0.393 * 1000
-    return 0.0
+    return None
 
 
 def per100_to_serving(val_100g: float, serving_g: float) -> float:
@@ -305,6 +363,8 @@ def display_value(
 def map_category_and_group(product: dict[str, Any]) -> tuple[str, str]:
     """Map an OFF product to the app's `(category, alt_group)` values."""
     cats = extract_categories(product)
+    pnns2 = safe_lower(product.get("pnns_groups_2") or product.get("pnns_groups_2_en") or "")
+    name_l = safe_lower(product.get("product_name_en") or product.get("product_name") or "")
     
     def has(*subs: str) -> bool:
         return any(any(s in c for s in subs) for c in cats)
@@ -331,7 +391,9 @@ def map_category_and_group(product: dict[str, Any]) -> tuple[str, str]:
             return ("cereal", "granola")
         return ("cereal", "cereal")
 
-    if has("beverages", "drinks", "soft-drinks", "sodas", "juice", "juices", "water"):
+    if has("beverages", "beverage", "drinks", "drink", "soft-drinks", "soft-drink", "sodas", "soda", "colas", "cola", "juice", "juices", "water"):
+        return ("drink", "drink")
+    if ("beverage" in pnns2) or text_has_any(ALT_KEYWORDS["drink"], name_l):
         return ("drink", "drink")
 
     if has("ice-cream", "ice-creams", "frozen-dessert", "frozen-desserts"):
@@ -359,12 +421,12 @@ def fallback_group_from_text(
     cats_l = [safe_lower(c) for c in (cats_list or [])]
 
     # Scan in priority order
-    for ag in ["nuts-seeds", "snack", "bread", "oats", "rice", "quinoa", "pasta-noodles", "cereal", "ice-cream", "drink"]:
+    for ag in ["drink", "nuts-seeds", "snack", "bread", "oats", "rice", "quinoa", "pasta-noodles", "cereal", "ice-cream"]:
         if text_has_any(ALT_KEYWORDS.get(ag, []), name_l) or any(t in " ".join(cats_l) for t in OFF_TAGS_MULTI[ag]):
             return (CANON_CATEGORY_FOR_GROUP.get(ag, "snack"), ag)
     
     # Last resort: drinks by name
-    if re.search(r"\b(water|juice|beverage|drink|soda)\b", name_l):
+    if re.search(r"\b(water|juice|beverage|drink|soda|cola|coke|pop)\b", name_l):
         return ("drink", "drink")
     
     return None
@@ -381,17 +443,43 @@ def looks_like_barcode(code: str) -> bool:
 
 
 # Main fetch function
-def fetch_and_normalize_off(barcode: str) -> dict[str, Any]:
-    """Fetch one OFF product by barcode and return a normalized feature dictionary."""
+@lru_cache(maxsize=512)
+def _fetch_and_normalize_off_cached(barcode: str) -> dict[str, Any]:
+    """Cached OFF barcode normalization to avoid repeated network fetches for the same code."""
     if not looks_like_barcode(barcode):
         raise ValueError("bad barcode")
-    
-    r = safe_get(OFF_URL.format(barcode=barcode), timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    
-    if data.get("status") != 1:
-        raise ValueError("Product not found")
+
+    barcode_candidates = [barcode]
+    stripped = barcode.lstrip("0")
+    if stripped and stripped != barcode and len(stripped) in VALID_CODE_LEN:
+        barcode_candidates.append(stripped)
+
+    data: dict[str, Any] | None = None
+    matched_barcode = barcode
+
+    for code in barcode_candidates:
+        for base_url in OFF_FALLBACK_BASE_URLS:
+            for path in OFF_PRODUCT_API_PATHS:
+                url = f"{base_url}{path.format(barcode=code)}"
+                r = safe_get(url)
+                if r.status_code == 404:
+                    continue
+                r.raise_for_status()
+                payload = r.json()
+                if payload.get("status") == 1 and isinstance(payload.get("product"), dict):
+                    data = payload
+                    matched_barcode = code
+                    break
+            if data is not None:
+                break
+        if data is not None:
+            break
+
+    if data is None:
+        raise ValueError(
+            f"Product not found for barcode {barcode} in Open Food Facts. "
+            "Try another barcode or use Manual Entry."
+        )
 
     p = data["product"]
     n = p.get("nutriments", {}) or {}
@@ -402,7 +490,7 @@ def fetch_and_normalize_off(barcode: str) -> dict[str, Any]:
     features = {
         "name": p.get("product_name_en") or p.get("product_name") or barcode,
         "brand": (p.get("brands") or "").split(",")[0].strip() if p.get("brands") else None,
-        "upc": barcode,
+        "upc": matched_barcode,
         "source": "openfoodfacts",
         "created_at": datetime.now(timezone.utc).isoformat(),
 
@@ -440,7 +528,18 @@ def fetch_and_normalize_off(barcode: str) -> dict[str, Any]:
     features["__display"] = disp
     features["net_carbs_g"] = compute_net_carbs_local(features)
     
-    return features
+    return ensure_row_group_fields(features)
+
+
+def fetch_and_normalize_off(barcode: str) -> dict[str, Any]:
+    """
+    Fetch one OFF product by barcode and return normalized features.
+
+    Uses an in-process cache so repeated lookups of the same barcode are fast.
+    """
+    normalized = _fetch_and_normalize_off_cached((barcode or "").strip())
+    # Return a copy so callers can safely mutate fields without polluting cache.
+    return copy.deepcopy(normalized)
 
 
 def infer_alt_group_for_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -452,11 +551,19 @@ def infer_alt_group_for_item(item: dict[str, Any]) -> dict[str, Any]:
     cats_all = out.get("categories_all") or ""
     cats = cats_all.split("|") if isinstance(cats_all, str) and cats_all else []
 
-    # If already good, normalize category to canonical and return
+    # If already good, normalize category to canonical and return.
+    # Special case: allow a correction away from generic "snack" when text strongly indicates another group.
     if ag in TARGET_GROUPS:
+        if ag == "snack":
+            fix = fallback_group_from_text(name, ingr, cats)
+            if fix and fix[1] != "snack":
+                new_cat, new_ag = fix
+                out["alt_group"] = new_ag
+                out["category"] = CANON_CATEGORY_FOR_GROUP.get(new_ag, new_cat)
+                return ensure_row_group_fields(out)
         if ag in CANON_CATEGORY_FOR_GROUP:
             out["category"] = CANON_CATEGORY_FOR_GROUP[ag]
-        return out
+        return ensure_row_group_fields(out)
 
     # Try to infer from name/ingredients/tags
     fix = fallback_group_from_text(name, ingr, cats)
@@ -464,7 +571,7 @@ def infer_alt_group_for_item(item: dict[str, Any]) -> dict[str, Any]:
         new_cat, new_ag = fix
         out["alt_group"] = new_ag
         out["category"] = CANON_CATEGORY_FOR_GROUP.get(new_ag, new_cat)
-        return out
+        return ensure_row_group_fields(out)
 
     # As a final nudge, use name-only high-confidence keywords
     name_l = safe_lower(name)
@@ -472,15 +579,15 @@ def infer_alt_group_for_item(item: dict[str, Any]) -> dict[str, Any]:
         if any(re.search(p, name_l) for p in patterns):
             out["alt_group"] = guess_ag
             out["category"] = CANON_CATEGORY_FOR_GROUP.get(guess_ag, out.get("category"))
-            return out
+            return ensure_row_group_fields(out)
 
     # If still unknown, leave as-is
-    return out
+    return ensure_row_group_fields(out)
 
 
 def fetch_category_products(category: str, limit: int = 50) -> list[dict[str, Any]]:
     """Search OFF by category term and return normalized products up to `limit`."""
-    search_url = "https://world.openfoodfacts.org/cgi/search.pl"
+    search_url = f"{OFF_BASE_URL}/cgi/search.pl"
     
     params = {
         "search_terms": category,
@@ -493,7 +600,7 @@ def fetch_category_products(category: str, limit: int = 50) -> list[dict[str, An
     }
     
     try:
-        r = safe_get(search_url, params=params, timeout=30)
+        r = safe_get(search_url, params=params)
         r.raise_for_status()
         data = r.json()
         
@@ -555,7 +662,7 @@ def fetch_category_products(category: str, limit: int = 50) -> list[dict[str, An
                 
                 # Ensure we have valid nutritional data
                 if features.get("carbs_g") is not None or safe_float(features.get("calories"), 0.0) > 0:
-                    products.append(features)
+                    products.append(ensure_row_group_fields(features))
                 
                 # Add small delay to be respectful to the API
                 time.sleep(0.1)

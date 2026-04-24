@@ -8,6 +8,7 @@ Why:
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,6 @@ from .model_components import (
     ModelType,
     build_pipeline,
     compute_net_carbs,
-    make_preprocessor,
     rule_points_and_reasons,
     weak_label,
 )
@@ -80,7 +80,7 @@ def generate_synthetic_data(n: int = 1000, random_state: int = 42) -> pd.DataFra
         {
             "name": [f"Product {i}" for i in range(n)],
             "brand": [f"Brand {rng.integers(1, 50)}" for _ in range(n)],
-            "upc": [str(100000000000 + int(rng.integers(0, 9e11))) for _ in range(n)],
+            "upc": [str(100000000000 + int(rng.integers(0, 900_000_000_000))) for _ in range(n)],
             "source": "synthetic",
             "created_at": pd.Timestamp("2025-09-01"),
             "category": rng.choice(categories, size=n),
@@ -290,3 +290,59 @@ def load_model(artifacts_dir: str) -> tuple[Any, dict[str, Any]]:
     model = joblib.load(model_path)
 
     return model, meta
+
+
+def _artifact_files_for_meta(artifacts_dir: str, meta: dict[str, Any]) -> list[Path]:
+    """Return the exact artifact files that define the active model binary."""
+    artifacts_path = Path(artifacts_dir)
+    model_type = str(meta.get("model_type", "logreg")).strip().lower()
+    files = [artifacts_path / "meta.joblib"]
+    if model_type == "xgboost":
+        files.extend([artifacts_path / "preprocessor.joblib", artifacts_path / "xgb_model.json"])
+    else:
+        files.append(artifacts_path / "model.joblib")
+    return files
+
+
+def compute_model_fingerprint(artifacts_dir: str, *, meta: dict[str, Any] | None = None) -> str:
+    """
+    Compute a stable SHA-256 fingerprint for active model artifacts.
+
+    The hash includes both filenames and file bytes so it changes whenever
+    model binaries or metadata change.
+    """
+    artifacts_path = Path(artifacts_dir)
+    if meta is None:
+        meta_path = artifacts_path / "meta.joblib"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"{meta_path} not found")
+        meta = joblib.load(meta_path)
+
+    files = _artifact_files_for_meta(artifacts_dir, meta)
+    hasher = hashlib.sha256()
+    for path in files:
+        if not path.exists():
+            raise FileNotFoundError(f"{path} not found")
+        hasher.update(path.name.encode("utf-8"))
+        hasher.update(b"\0")
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def model_identity(artifacts_dir: str) -> dict[str, str]:
+    """Return model identity fields used for retrieval-sync verification."""
+    artifacts_path = Path(artifacts_dir)
+    meta_path = artifacts_path / "meta.joblib"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"{meta_path} not found")
+    meta = joblib.load(meta_path)
+    model_type = str(meta.get("model_type", "logreg")).strip().lower()
+    return {
+        "model_type": model_type,
+        "model_fingerprint": compute_model_fingerprint(artifacts_dir, meta=meta),
+    }
