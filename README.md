@@ -39,15 +39,15 @@ Manual Entry:
 
 ```mermaid
 flowchart LR
-    A[Open Food Facts + Input CSV] --> B[Cleaning and Dedupe]
-    B --> C[Build Nutrition Fields + Rule Labels]
-    C --> D[Train Model: LogReg or XGBoost]
-    D --> E[Artifacts: model + meta]
-    E --> F[Rescore Candidate Pool]
-    F --> G[Qdrant Index (semantic retrieval)]
-    E --> H[Streamlit App]
+    A["Open Food Facts + Input CSV"] --> B["Cleaning and Dedupe"]
+    B --> C["Build Nutrition Fields + Rule Labels"]
+    C --> D["Train Model: LogReg or XGBoost"]
+    D --> E["Artifacts: model + meta"]
+    E --> F["Rescore Candidate Pool"]
+    F --> G["Qdrant Index - semantic retrieval"]
+    E --> H["Streamlit App"]
     G --> H
-    H --> I[Risk Score + Explanations + Alternatives]
+    H --> I["Risk Score + Explanations + Alternatives"]
 ```
 
 The app uses Qdrant retrieval by default. If Qdrant is unavailable, it falls back to built-in heuristic matching.

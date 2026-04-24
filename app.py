@@ -886,7 +886,7 @@ def main() -> None:
     st.divider()
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 20px;">
-        <p><strong>Dianalysis v0.1.0</strong></p>
+        <p><strong>Dianalysis v1.1.0</strong></p>
         <p>Educational demo for diabetes-aware food scoring.</p>
         <p>This tool provides educational guidance only. Always consult healthcare professionals for medical advice.</p>
     </div>
