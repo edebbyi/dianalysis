@@ -10,7 +10,6 @@ Diabetes-risk screening for packaged foods using simple nutrition rules, machine
 - App UI: Streamlit
 - ML: scikit-learn (Logistic Regression), XGBoost (optional)
 - Data: pandas, NumPy
-- Data/versioning pipeline: DVC
 - Experiment tracking: MLflow (optional, used in experiment workflows)
 - Container: Docker
 - Retrieval: Qdrant vector search (default) with heuristic fallback
@@ -24,6 +23,7 @@ Diabetes-risk screening for packaged foods using simple nutrition rules, machine
 - Test guide (what tests cover and how to run them): [`tests/README.md`](tests/README.md)
 - Contribution workflow: [`docs/contributing.md`](docs/contributing.md)
 - Release/tag workflow: [`docs/releasing.md`](docs/releasing.md)
+- Optional maintainer doc (local DVC workflow): [`docs/dvc_setup.md`](docs/dvc_setup.md)
 
 ## Demo
 
@@ -107,6 +107,7 @@ python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
+The active dataset (`data/products_off_clean.csv`) is included in this repo.
 
 ## Quickstart
 
