@@ -7,11 +7,16 @@ from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any
 
+qmodels: Any
+QdrantClientType: Any | None
 try:  # optional dependency
-    from qdrant_client import QdrantClient
-    from qdrant_client.http import models as qmodels
+    from qdrant_client import QdrantClient as _QdrantClient
+    from qdrant_client.http import models as _qmodels
+
+    QdrantClientType = _QdrantClient
+    qmodels = _qmodels
 except Exception:  # pragma: no cover
-    QdrantClient = None
+    QdrantClientType = None
     qmodels = None
 
 DEFAULT_COLLECTION = "dianalysis_products"
@@ -43,7 +48,7 @@ def qdrant_api_key() -> str:
 def retrieval_enabled() -> bool:
     """Return True when semantic retrieval is enabled and deps exist."""
     backend = os.getenv("DIANALYSIS_RETRIEVAL_BACKEND", "qdrant").strip().lower()
-    return backend == "qdrant" and QdrantClient is not None and find_spec("sentence_transformers") is not None
+    return backend == "qdrant" and QdrantClientType is not None and find_spec("sentence_transformers") is not None
 
 
 @lru_cache(maxsize=1)
@@ -55,14 +60,14 @@ def _sentence_transformer_class() -> Any:
 
 
 @lru_cache(maxsize=1)
-def qdrant_client() -> QdrantClient:
+def qdrant_client() -> Any:
     """Create one cached Qdrant client."""
-    if QdrantClient is None:  # pragma: no cover
+    if QdrantClientType is None:  # pragma: no cover
         raise RuntimeError("qdrant-client is not installed")
     key = qdrant_api_key()
     if key:
-        return QdrantClient(url=qdrant_url(), api_key=key)
-    return QdrantClient(url=qdrant_url())
+        return QdrantClientType(url=qdrant_url(), api_key=key)
+    return QdrantClientType(url=qdrant_url())
 
 
 @lru_cache(maxsize=1)
