@@ -38,12 +38,14 @@ ModelType = Literal["logreg", "xgboost"]
 TOTAL_CARBS_RISK_G = 30.0
 BEVERAGE_CARBS_RISK_G = 20.0
 ADDED_SUGAR_RISK_G = 10.0
+EXTREME_ADDED_SUGAR_G = 25.0
 TOTAL_SUGAR_INFERRED_RISK_G = 10.0
 SODIUM_RISK_MG = 460.0
 FIBER_PROTECTIVE_G = 5.6
 PROTEIN_PROTECTIVE_G = 10.0
 EMPTY_CALORIE_SUGAR_G = 10.0
 LABEL_POSITIVE_THRESHOLD = 2
+NUTRIENT_VALUE_MARGIN_G = 1.0
 
 INFERRED_SUGAR_CATEGORIES = {"drink", "snack", "dessert"}
 
@@ -107,6 +109,12 @@ def rule_data_confidence(row: dict[str, Any]) -> tuple[str, list[str]]:
         notes.append("Total sugar missing")
     if sodium is None:
         notes.append("Sodium missing")
+    if carbs is not None and sugar is not None and sugar > (carbs + NUTRIENT_VALUE_MARGIN_G):
+        notes.append("Total sugar exceeds total carbs (possible source-data error)")
+    if carbs is not None and added is not None and added > (carbs + NUTRIENT_VALUE_MARGIN_G):
+        notes.append("Added sugar exceeds total carbs (possible source-data error)")
+    if sugar is not None and added is not None and added > (sugar + NUTRIENT_VALUE_MARGIN_G):
+        notes.append("Added sugar exceeds total sugar (possible source-data error)")
     if _supports_inferred_sugar_rule(row) and added is None:
         notes.append("Added sugar missing in processed-food category")
     if sugar is not None and sugar >= TOTAL_SUGAR_INFERRED_RISK_G:
@@ -125,6 +133,8 @@ def rule_points_reasons_meta(row: dict[str, Any]) -> tuple[int, list[str], dict[
         "beverage_threshold_used": False,
         "inferred_added_sugar": False,
         "empty_calorie_penalty": False,
+        "extreme_added_sugar": False,
+        "implausible_sugar_values": False,
     }
 
     confidence, confidence_notes = rule_data_confidence(row)
@@ -141,16 +151,32 @@ def rule_points_reasons_meta(row: dict[str, Any]) -> tuple[int, list[str], dict[
 
     sugar = _to_float_or_none(row.get("sugar_g"))
     added = _to_float_or_none(row.get("added_sugar_g"))
+    high_added_sugar = False
     if added is not None:
         if added >= ADDED_SUGAR_RISK_G:
             pts += 2
             reasons.append(f"High added sugar ({added:.1f}g ≥ {ADDED_SUGAR_RISK_G:.0f}g)")
+            high_added_sugar = True
+        if added >= EXTREME_ADDED_SUGAR_G:
+            pts += 2
+            meta["extreme_added_sugar"] = True
+            reasons.append(f"Very high added sugar ({added:.1f}g ≥ {EXTREME_ADDED_SUGAR_G:.0f}g)")
     elif _supports_inferred_sugar_rule(row) and sugar is not None and sugar >= TOTAL_SUGAR_INFERRED_RISK_G:
         pts += 2
         meta["inferred_added_sugar"] = True
         reasons.append(
             f"Added sugar not listed; inferred risk from total sugar ({sugar:.1f}g ≥ {TOTAL_SUGAR_INFERRED_RISK_G:.0f}g)"
         )
+
+    implausible_sugar_values = (
+        (carbs is not None and sugar is not None and sugar > (carbs + NUTRIENT_VALUE_MARGIN_G))
+        or (carbs is not None and added is not None and added > (carbs + NUTRIENT_VALUE_MARGIN_G))
+        or (sugar is not None and added is not None and added > (sugar + NUTRIENT_VALUE_MARGIN_G))
+    )
+    if implausible_sugar_values:
+        pts += 1
+        meta["implausible_sugar_values"] = True
+        reasons.append("Sugar values are internally inconsistent; risk raised pending data verification")
 
     sodium = _to_float_or_none(row.get("sodium_mg"))
     if sodium is not None and sodium >= SODIUM_RISK_MG:
@@ -159,13 +185,24 @@ def rule_points_reasons_meta(row: dict[str, Any]) -> tuple[int, list[str], dict[
 
     fiber = _to_float_or_none(row.get("fiber_g"))
     if fiber is not None and fiber >= FIBER_PROTECTIVE_G:
-        pts -= 2
-        reasons.append(f"Protective fiber ({fiber:.1f}g ≥ {FIBER_PROTECTIVE_G:.1f}g)")
+        if high_added_sugar:
+            pts -= 1
+            reasons.append(
+                f"Fiber benefit is limited when added sugar is high ({fiber:.1f}g ≥ {FIBER_PROTECTIVE_G:.1f}g)"
+            )
+        else:
+            pts -= 2
+            reasons.append(f"Protective fiber ({fiber:.1f}g ≥ {FIBER_PROTECTIVE_G:.1f}g)")
 
     protein = _to_float_or_none(row.get("protein_g"))
     if protein is not None and protein >= PROTEIN_PROTECTIVE_G:
-        pts -= 1
-        reasons.append(f"Protein helps satiety ({protein:.1f}g ≥ {PROTEIN_PROTECTIVE_G:.0f}g)")
+        if high_added_sugar:
+            reasons.append(
+                f"Protein present ({protein:.1f}g), but high added sugar keeps risk elevated"
+            )
+        else:
+            pts -= 1
+            reasons.append(f"Protein helps satiety ({protein:.1f}g ≥ {PROTEIN_PROTECTIVE_G:.0f}g)")
 
     fat = _to_float_or_none(row.get("fat_g"))
     fiber_for_penalty = 0.0 if fiber is None else max(fiber, 0.0)

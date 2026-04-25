@@ -188,12 +188,79 @@ def load_trained_model(_artifact_state: tuple[Any, ...]) -> tuple[Any, dict[str,
             return model, meta, saved_metrics
         except Exception as e:
             st.warning(f"Could not load existing model: {e}. Training new model...")
-    
-    # Train new model
-    with st.spinner("Training model on synthetic data..."):
-        df = generate_synthetic_data(n=1000, random_state=42)
-        model, metrics = train_model(df, artifacts_dir=artifacts_dir)
-        meta = {"num_cols": None, "cat_cols": None, "categories": None}
+
+    def _dedupe_products(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop duplicate products by UPC, with name+brand fallback when UPC is missing."""
+        out = df.copy()
+        upc = out["upc"].fillna("").astype(str).str.strip() if "upc" in out.columns else pd.Series("", index=out.index)
+        name = (
+            out["name"].fillna("").astype(str).str.lower().str.strip()
+            if "name" in out.columns
+            else pd.Series("", index=out.index)
+        )
+        brand = (
+            out["brand"].fillna("").astype(str).str.lower().str.strip()
+            if "brand" in out.columns
+            else pd.Series("", index=out.index)
+        )
+        has_upc = upc != ""
+        key = pd.Series(index=out.index, dtype="string")
+        key.loc[has_upc] = "upc:" + upc.loc[has_upc]
+        key.loc[~has_upc] = "namebrand:" + name.loc[~has_upc] + "|" + brand.loc[~has_upc]
+        out["_dedupe_key"] = key
+        return out.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
+
+    cfg_model_type = str(cfg_get(_APP_CFG, "model", "model_type", default="logreg")).strip().lower()
+    if cfg_model_type not in {"logreg", "xgboost"}:
+        cfg_model_type = "logreg"
+    cfg_class_weight_raw = str(cfg_get(_APP_CFG, "model", "class_weight", default="balanced")).strip()
+    cfg_class_weight: str | dict | None = None if cfg_class_weight_raw.lower() == "none" else cfg_class_weight_raw
+    cfg_c = float(cfg_get(_APP_CFG, "model", "C", default=0.3))
+    cfg_add_indicator = bool(cfg_get(_APP_CFG, "model", "with_missing_indicator", default=True))
+    cfg_random_state = int(cfg_get(_APP_CFG, "project", "random_state", default=42))
+    cfg_cv_folds = int(cfg_get(_APP_CFG, "training", "cv_folds", default=5))
+    cfg_use_synthetic = bool(cfg_get(_APP_CFG, "training", "use_synthetic", default=False))
+    cfg_synth_n = int(cfg_get(_APP_CFG, "training", "synthetic_n", default=1000))
+    xgb_params = {
+        "n_estimators": int(cfg_get(_APP_CFG, "model", "xgb", "n_estimators", default=300)),
+        "max_depth": int(cfg_get(_APP_CFG, "model", "xgb", "max_depth", default=4)),
+        "learning_rate": float(cfg_get(_APP_CFG, "model", "xgb", "learning_rate", default=0.05)),
+        "subsample": float(cfg_get(_APP_CFG, "model", "xgb", "subsample", default=0.9)),
+        "colsample_bytree": float(cfg_get(_APP_CFG, "model", "xgb", "colsample_bytree", default=0.9)),
+    }
+
+    data_mode = "synthetic"
+    if not cfg_use_synthetic and os.path.exists(CLEAN_CSV_PATH):
+        try:
+            df = pd.read_csv(CLEAN_CSV_PATH, dtype={"upc": str})
+            df = _dedupe_products(df)
+            data_mode = "catalog"
+        except Exception as e:
+            st.warning(f"Could not load catalog data ({CLEAN_CSV_PATH}): {e}. Falling back to synthetic data.")
+            df = generate_synthetic_data(n=cfg_synth_n, random_state=cfg_random_state)
+    else:
+        df = generate_synthetic_data(n=cfg_synth_n, random_state=cfg_random_state)
+
+    # Train fallback model using the same config/data path as CLI training defaults.
+    with st.spinner(f"Training {cfg_model_type} model on {data_mode} data..."):
+        model, metrics = train_model(
+            df,
+            artifacts_dir=artifacts_dir,
+            random_state=cfg_random_state,
+            cv_folds=cfg_cv_folds,
+            model_type=cfg_model_type,  # type: ignore[arg-type]
+            class_weight=cfg_class_weight,
+            C=cfg_c,
+            add_indicator=cfg_add_indicator,
+            xgb_params=(xgb_params if cfg_model_type == "xgboost" else None),
+        )
+        meta = {
+            "model_type": cfg_model_type,
+            "class_weight": cfg_class_weight_raw,
+            "C": cfg_c,
+            "add_indicator": cfg_add_indicator,
+            "fallback_data_mode": data_mode,
+        }
     return model, meta, metrics
 
 
@@ -820,8 +887,8 @@ def main() -> None:
             st.caption("Soda")
             st.code("049000028904")
         with quick_cols[1]:
-            st.caption("Bagels")
-            st.code("5000436049135")
+            st.caption("Bread")
+            st.code("072945601369")
 
         barcode = st.text_input(
             "Barcode",

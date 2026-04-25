@@ -9,7 +9,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 
 from dianalysis.recommendation.vector_client import (
     collection_name,
@@ -77,4 +76,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

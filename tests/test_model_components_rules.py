@@ -83,6 +83,49 @@ class ModelComponentRuleTests(unittest.TestCase):
         self.assertEqual(confidence, "low")
         self.assertTrue(notes)
 
+    def test_implausible_added_sugar_is_flagged_and_penalized(self) -> None:
+        """Rows with impossible sugar relationships should be treated as higher-risk data anomalies."""
+        row = {
+            "category": "bread",
+            "alt_group": "bread",
+            "category_main": "bread",
+            "carbs_g": 55.0,
+            "sugar_g": 7.0,
+            "added_sugar_g": 140.0,  # Impossible: added sugar > total carbs.
+            "fiber_g": 6.3,
+            "protein_g": 10.5,
+            "fat_g": 3.2,
+            "sodium_mg": 0.5,
+        }
+        confidence, notes = rule_data_confidence(row)
+        self.assertEqual(confidence, "low")
+        self.assertTrue(any("Added sugar exceeds total carbs" in n for n in notes))
+
+        pts, reasons, meta = rule_points_reasons_meta(row)
+        self.assertGreaterEqual(pts, 3)
+        self.assertTrue(meta.get("extreme_added_sugar"))
+        self.assertTrue(meta.get("implausible_sugar_values"))
+        self.assertTrue(any("Very high added sugar" in r for r in reasons))
+
+    def test_high_added_sugar_limits_protective_offsets(self) -> None:
+        """Protein/fiber credits should be limited when added sugar is high."""
+        row = {
+            "category": "bread",
+            "alt_group": "bread",
+            "category_main": "bread",
+            "carbs_g": 50.0,
+            "sugar_g": 15.0,
+            "added_sugar_g": 15.0,
+            "fiber_g": 8.0,
+            "protein_g": 12.0,
+            "fat_g": 3.0,
+            "sodium_mg": 150.0,
+        }
+        pts, reasons, _meta = rule_points_reasons_meta(row)
+        self.assertGreaterEqual(pts, 3)
+        self.assertTrue(any("Fiber benefit is limited" in r for r in reasons))
+        self.assertTrue(any("high added sugar keeps risk elevated" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

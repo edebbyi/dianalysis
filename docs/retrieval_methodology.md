@@ -137,4 +137,4 @@ If alternatives look off:
    - `make verify-sync-docker`
 4. Re-test with known barcodes:
    - `049000028904` (Coca-Cola Original Taste Soda)
-   - `5000436049135` (Tesco Original Bagels 5 Pack)
+   - `072945601369` (Honey Wheat Bread)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any
+from uuid import UUID
 
 import pandas as pd
 
@@ -81,7 +82,7 @@ def prune_collection_by_keys(name: str, keep_keys: set[str], batch_size: int = 5
         return 0
 
     for start in range(0, len(to_delete), batch_size):
-        chunk = to_delete[start : start + batch_size]
+        chunk: list[int | str | UUID] = [int(pid) for pid in to_delete[start : start + batch_size]]
         client.delete(
             collection_name=name,
             points_selector=qmodels.PointIdsList(points=chunk),
