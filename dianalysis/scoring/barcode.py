@@ -32,9 +32,13 @@ def _is_sufficient_barcode_nutrition(item: dict) -> tuple[bool, str | None]:
         if shown and shown != "not listed":
             known_fields += 1
 
+        val_raw = item.get(field)
         try:
-            val = float(item.get(field)) if item.get(field) is not None else 0.0
-        except Exception:
+            if isinstance(val_raw, (int, float, str)):
+                val = float(val_raw)
+            else:
+                val = 0.0
+        except (TypeError, ValueError):
             val = 0.0
 
         if val > 0.0:

@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Any
 
 try:  # Python 3.11+
-    import tomllib  # type: ignore[attr-defined]
+    import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python <3.11 fallback
     try:
         import tomli as tomllib  # type: ignore[no-redef]
     except ModuleNotFoundError:  # pragma: no cover - final fallback
-        import toml as _toml  # type: ignore[import-not-found]
+        import toml as _toml
 
         class _TomlCompat:
             @staticmethod

@@ -44,12 +44,14 @@ def _enforce_lower_risk_alternatives(alts: list[dict], current_risk: int, k: int
 
     # Always show best-first by risk, then by net carbs, then by higher fiber.
     def _safe_float(val: object, default: float) -> float:
-        try:
-            if val is None:
-                return default
-            return float(val)
-        except Exception:
+        if val is None:
             return default
+        try:
+            if isinstance(val, (int, float, str)):
+                return float(val)
+        except (TypeError, ValueError):
+            return default
+        return default
 
     valid = sorted(
         valid,
@@ -95,8 +97,11 @@ def _to_float_or_none(val: object) -> float | None:
     if val is None:
         return None
     try:
-        out = float(val)
-    except Exception:
+        if isinstance(val, (int, float, str)):
+            out = float(val)
+        else:
+            return None
+    except (TypeError, ValueError):
         return None
     if np.isnan(out):
         return None
