@@ -493,8 +493,10 @@ def display_alternatives(
 
     ranked_alternatives = sorted(alternatives, key=_sort_key)
 
-    for alt in ranked_alternatives:
-        tier = str(alt.get("tier", "Good")).title()
+    choice_labels = ("Best", "Better", "Good")
+
+    for idx, alt in enumerate(ranked_alternatives):
+        tier = choice_labels[idx] if idx < len(choice_labels) else "Good"
         alt_name = str(alt.get("name", "Unknown"))
         alt_brand = alt.get("brand", "N/A")
         alt_risk = _as_float(alt.get("risk_score"), 100.0)
