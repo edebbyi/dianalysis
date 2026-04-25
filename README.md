@@ -74,11 +74,14 @@ Labeling is rules-based and used for training:
 
 - `label = 1` when rule points are `>= 2`, otherwise `0`
 - This is a training helper label, not a diagnosis label
+- Implausible sugar relationships (for example `added_sugar_g > carbs_g`) are treated as data anomalies and receive a risk penalty during labeling/scoring.
+- Very high added sugar (`>= 25g` per serving) receives an extra risk boost.
+- Fiber/protein protective offsets are reduced when added sugar is high, so very sugary items are not over-protected.
 
 Score output includes a `data_confidence` flag:
 
 - `high`: key nutrition fields were present
-- `low`: one or more important fields were missing
+- `low`: one or more important fields were missing or nutriment values were internally inconsistent (for example sugar values exceeding carbs)
 
 For full rule definitions, thresholds, and comparison results:
 
@@ -133,6 +136,11 @@ Start app:
 streamlit run app.py -- --config configs/base.toml
 ```
 Starts the local Streamlit app with the base config.
+
+Fallback training behavior in app:
+
+- If `artifacts/` are missing, the app trains a fallback model using the active runtime config (`base + profile + env`) and the catalog CSV (`data/products_off_clean.csv`) when available.
+- The app only falls back to synthetic data when configured (`training.use_synthetic=true`) or when CSV loading fails.
 
 Use XGBoost profile:
 
@@ -316,6 +324,21 @@ QDRANT_URL = "https://<your-cluster-url>"
 QDRANT_API_KEY = "<your-api-key>"
 DIANALYSIS_QDRANT_COLLECTION = "dianalysis_products"
 DIANALYSIS_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+```
+
+Pinning model artifacts for deterministic app scoring:
+
+- `artifacts/` is gitignored by default, so cloud deploys can otherwise retrain at runtime when artifacts are missing.
+- To pin a promoted model in git, force-add the exact files used at inference:
+
+```bash
+git add -f artifacts/meta.joblib artifacts/model.joblib
+```
+
+- For XGBoost artifacts, force-add:
+
+```bash
+git add -f artifacts/meta.joblib artifacts/preprocessor.joblib artifacts/xgb_model.json
 ```
 
 Local secret storage and connection test:

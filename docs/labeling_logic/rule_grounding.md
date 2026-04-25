@@ -14,10 +14,12 @@ Per serving:
 - `carbs_g >= 30` -> `+2`
 - Beverage-like items use `carbs_g >= 20` -> `+2`
 - `added_sugar_g >= 10` -> `+2`
+- `added_sugar_g >= 25` -> additional `+2` (extreme added-sugar boost)
 - If `added_sugar_g` is missing for processed-food categories (`drink`, `snack`, `dessert`), use `sugar_g >= 10` as an inferred sugar risk signal -> `+2`
+- Implausible sugar relationships (for example `added_sugar_g > carbs_g`, `added_sugar_g > sugar_g`, or `sugar_g > carbs_g`) -> `+1` and low-confidence flag
 - `sodium_mg >= 460` -> `+1`
-- `fiber_g >= 5.6` -> `-2`
-- `protein_g >= 10` -> `-1`
+- `fiber_g >= 5.6` -> `-2` normally, but only `-1` when added sugar is high (`>=10g`)
+- `protein_g >= 10` -> `-1` normally, but no protein credit when added sugar is high (`>=10g`)
 - Empty-calorie penalty: if sugar is high and fiber/protein/fat are near zero -> `+1`
 - Positive label: `score >= 2`
 
@@ -43,10 +45,12 @@ Reason:
 |---|---:|---|
 | Total carbs | `>= 30g` (+2); beverage-like items `>= 20g` (+2) | Keeps the broad meal-style threshold while preventing small sugary drinks from slipping through. |
 | Added sugar | `>= 10g` (+2) | `10g` is 20% of FDA DV (`50g`), matching "high" (%DV) logic. |
+| Extreme added sugar | `>= 25g` (+2 extra) | Prevents very sugary products from appearing moderate-risk due to protective offsets. |
 | Missing added sugar fallback | If added sugar missing and item is processed (`drink`, `snack`, `dessert`), use `sugar_g >= 10g` (+2) | Avoids false low-risk calls when source data omits added sugar for highly processed foods. |
+| Implausible sugar values | If sugar values conflict (`added > carbs`, `added > total sugar`, or `total sugar > carbs`), `+1` | Flags likely source-data errors and keeps risk conservative until data is verified. |
 | Sodium | `>= 460mg` (+1) | `460mg` is 20% of FDA DV (`2300mg`), matching "high" (%DV) logic. |
-| Fiber | `>= 5.6g` (-2) | `5.6g` is 20% of FDA DV (`28g`), treated as a strong protective signal. |
-| Protein | `>= 10g` (-1) | `10g` is 20% of FDA DV (`50g`), treated as minor protective support (satiety context). |
+| Fiber | `>= 5.6g` (`-2` normally, `-1` if added sugar is high) | Preserves fiber credit while preventing high-sugar products from being over-protected. |
+| Protein | `>= 10g` (`-1` normally, `0` if added sugar is high) | Keeps satiety context but avoids protein canceling strong high-sugar risk. |
 | Empty-calorie penalty | If `sugar_g > 10g` and fiber/protein/fat are near zero, `+1` | Captures high-sugar, low-buffer products that are metabolically weak despite low sodium/carb totals. |
 
 ## Scoring Examples
@@ -77,6 +81,10 @@ Dataset used: `data/products_off_clean.csv` (`n=431`)
 Evaluation date: `2026-04-20`
 Reproducible run commands: `make threshold-compare` or `python experiments/threshold_comparison.py --input-csv data/products_off_clean.csv --output-json docs/labeling_logic/results/threshold_comparison_products_off_clean.json --output-md docs/labeling_logic/results/threshold_comparison_products_off_clean.md`  
 Saved run outputs: `docs/labeling_logic/results/threshold_comparison_products_off_clean.json` and `docs/labeling_logic/results/threshold_comparison_products_off_clean.md`
+
+Note:
+- The table below was generated before the newer anomaly-handling additions (`extreme added sugar`, `implausible sugar value` penalty, and reduced protective offsets under high added sugar).
+- Re-run the threshold comparison command to refresh label-rate numbers under the current active rules.
 
 | Rule set | Positive trigger | Positive label rate |
 |---|---:|---:|
@@ -138,7 +146,8 @@ Display-only cap for carb-only positives:
 ## Data Confidence
 
 - Score output includes a `data_confidence` flag (`high` or `low`).
-- `low` means one or more critical fields were missing in source data (for example missing added sugar in a processed-food category).
+- `low` means one or more critical fields were missing in source data, or nutrient values were internally inconsistent.
+- Inconsistent examples include `added_sugar_g > carbs_g`, `added_sugar_g > sugar_g`, and `sugar_g > carbs_g`.
 - In low-confidence cases, explanations call out the missing fields so the user can interpret results cautiously.
 
 ## Sources
