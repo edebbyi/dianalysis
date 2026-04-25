@@ -24,6 +24,9 @@ from ..type_defs import ModelLike
 
 
 CARB_ONLY_DISPLAY_CAP = 85
+HIGH_CARB_ADDED_SUGAR_FLOOR = 45
+HIGH_CARB_SODIUM_FLOOR = 45
+HIGH_CARB_ADDED_SUGAR_SODIUM_FLOOR = 60
 
 
 def _enforce_lower_risk_alternatives(alts: list[dict], current_risk: int, k: int = 3) -> list[dict]:
@@ -108,6 +111,65 @@ def _to_float_or_none(val: object) -> float | None:
     return out
 
 
+def _risk_floor_for_item(
+    row: dict,
+    *,
+    rule_points: int,
+    rule_meta: dict[str, object],
+) -> tuple[int, str | None]:
+    """
+    Return a rule-based minimum risk floor and explanation when applicable.
+
+    Why:
+    - Keep model ranking as primary signal.
+    - Prevent clearly high-load nutrient combinations from landing at ultra-low risk.
+    """
+    floor = 0
+    reason: str | None = None
+
+    # Existing guardrail for inferred sugar and empty-calorie profiles.
+    if bool(rule_meta.get("inferred_added_sugar")) or bool(rule_meta.get("empty_calorie_penalty")):
+        if rule_points >= 4:
+            floor = 85
+        elif rule_points >= 3:
+            floor = 70
+        elif rule_points >= 2:
+            floor = 55
+        elif rule_points >= 1:
+            floor = 25
+        else:
+            floor = 0
+        if floor > 0:
+            reason = "Rule floor applied for inferred sugar or empty-calorie risk profile."
+
+    carbs = _to_float_or_none(row.get("carbs_g"))
+    added = _to_float_or_none(row.get("added_sugar_g"))
+    sodium = _to_float_or_none(row.get("sodium_mg"))
+
+    carbs_threshold = BEVERAGE_CARBS_RISK_G if _is_beverage_row(row) else TOTAL_CARBS_RISK_G
+    high_carbs = carbs is not None and carbs >= carbs_threshold
+    high_added_sugar = added is not None and added >= ADDED_SUGAR_RISK_G
+    high_sodium = sodium is not None and sodium >= SODIUM_RISK_MG
+
+    combo_floor = 0
+    combo_reason: str | None = None
+    if high_carbs and high_added_sugar and high_sodium:
+        combo_floor = HIGH_CARB_ADDED_SUGAR_SODIUM_FLOOR
+        combo_reason = "Rule floor applied for high carbs + high added sugar + high sodium."
+    elif high_carbs and high_added_sugar:
+        combo_floor = HIGH_CARB_ADDED_SUGAR_FLOOR
+        combo_reason = "Rule floor applied for high carbs + high added sugar."
+    elif high_carbs and high_sodium:
+        combo_floor = HIGH_CARB_SODIUM_FLOOR
+        combo_reason = "Rule floor applied for high carbs + high sodium."
+
+    if combo_floor > floor:
+        floor = combo_floor
+        reason = combo_reason
+
+    return floor, reason
+
+
 def _display_score_for_item(row: dict, *, rule_points: int, rule_meta: dict[str, object], risk_score_raw: int) -> tuple[int, bool]:
     """
     Return display score and whether a display cap was applied.
@@ -161,21 +223,12 @@ def score_item(item: dict, model: ModelLike, df_candidates: pd.DataFrame | None 
     data_confidence = str(rule_meta.get("data_confidence", "high") or "high")
     confidence_notes = list(rule_meta.get("confidence_notes", []) or [])
 
-    # Guardrail: do not let inferred high-sugar/empty-calorie cases appear as low-risk.
-    if bool(rule_meta.get("inferred_added_sugar")) or bool(rule_meta.get("empty_calorie_penalty")):
-        if pts >= 4:
-            floor = 85
-        elif pts >= 3:
-            floor = 70
-        elif pts >= 2:
-            floor = 55
-        elif pts >= 1:
-            floor = 25
-        else:
-            floor = 0
-        if floor > risk:
-            risk = floor
-            prob = risk / 100.0
+    applied_floor_reason: str | None = None
+    floor, floor_reason = _risk_floor_for_item(row, rule_points=pts, rule_meta=rule_meta)
+    if floor > risk:
+        risk = floor
+        prob = risk / 100.0
+        applied_floor_reason = floor_reason
 
     risk_score_display, display_cap_applied = _display_score_for_item(
         row,
@@ -190,6 +243,8 @@ def score_item(item: dict, model: ModelLike, df_candidates: pd.DataFrame | None 
         notes.append("Data confidence: low. One or more critical nutrition fields were missing in source data.")
         for c_note in confidence_notes:
             notes.append(f"Confidence note: {c_note}.")
+    if applied_floor_reason:
+        notes.append(applied_floor_reason)
     if display_cap_applied:
         notes.append(
             "Displayed risk score is capped for carb-heavy items without high added sugar or high sodium."

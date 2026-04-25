@@ -181,6 +181,31 @@ class ScoringPipelineEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(float(result["risk_score"]), 55.0)
         self.assertTrue(any("Data confidence" in str(n) for n in result.get("notes", [])))
 
+    def test_high_carb_high_added_sugar_floor_prevents_very_low_score(self) -> None:
+        """High-carb + high-added-sugar items should not score in an ultra-low range."""
+
+        class LowProbModel:
+            def predict_proba(self, X: pd.DataFrame) -> np.ndarray:  # noqa: N802
+                p1 = np.full(len(X), 0.02, dtype=float)
+                return np.column_stack([1.0 - p1, p1])
+
+        model = LowProbModel()
+        item = _row(
+            name="Frosted Cereal Example",
+            brand="Test",
+            upc="203",
+            category="cereal",
+            alt_group="cereal",
+            carbs_g=37.0,
+            fiber_g=3.0,
+            sugar_g=14.0,
+            added_sugar_g=10.0,
+            sodium_mg=240.0,
+        )
+        result = score_item(item, model, pd.DataFrame())
+        self.assertGreaterEqual(float(result["risk_score"]), 45.0)
+        self.assertTrue(any("high carbs + high added sugar" in str(n).lower() for n in result.get("notes", [])))
+
     def test_display_score_is_capped_for_carb_only_positive(self) -> None:
         """Display score is capped for carb-only positives while raw score stays intact."""
 
